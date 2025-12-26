@@ -4,15 +4,25 @@ import numpy as np
 from datetime import datetime, time
 import io
 import math
-import re  # 用於解析備註欄的數字與產線
+import re
 
 # ==========================================
 # 1. 核心邏輯區
 # ==========================================
-SYSTEM_VERSION = "v5.5 (Universal Dependency & Line Assign)"
+SYSTEM_VERSION = "v5.6 (Multi-Column Logic & Categorized Offline)"
 
-# ★★★ 修改 1: 更新線外關鍵字清單 ★★★
-OFFLINE_KEYWORDS = ["超音波熔接", "線邊雷射", "PT", "線邊組裝"]
+# ★★★ 修改 1: 線外製程分類對照表 (關鍵字 -> 顯示名稱) ★★★
+# 系統會依序檢查製程名稱是否包含 Key，若有則歸類為 Value
+OFFLINE_MAPPING = {
+    "超音波": "線外-超音波熔接",
+    "熔接": "線外-超音波熔接",
+    "LS": "線外-組裝前LS",
+    "雷射": "線外-組裝前LS",
+    "PT": "線外-PT",
+    "PKM": "線外-線邊組裝",
+    "線邊": "線外-線邊組裝",
+    "組裝前": "線外-線邊組裝" # 補強判斷
+}
 
 def get_base_model(product_id):
     if pd.isna(product_id): return ""
@@ -153,6 +163,9 @@ def load_and_clean_data(uploaded_file):
             elif '項次' in col: col_map['Priority'] = col
             elif '已領料' in col: col_map['Process_Type'] = col
             elif '備註' in col: col_map['Remarks'] = col
+            # 支援獨立欄位
+            elif '急單' in col: col_map['Rush_Col'] = col
+            elif '指定線' in col: col_map['Line_Col'] = col
             
         df = df.rename(columns={v: k for k, v in col_map.items()})
         
@@ -169,37 +182,47 @@ def load_and_clean_data(uploaded_file):
 
         df['Qty'] = np.where(df['Actual_Qty'] > 0, df['Actual_Qty'], df['Plan_Qty'])
         df = df[(df['Qty'] > 0) & (df['Manpower_Req'] > 0)]
-        
-        df['Is_Rush'] = df['Remarks'].astype(str).str.contains('急單', na=False)
         df['Base_Model'] = df['Product_ID'].apply(get_base_model)
         
-        def check_offline(val):
+        # --- 判斷是否為線外 ---
+        def check_offline_type(val):
             val_str = str(val)
-            for kw in OFFLINE_KEYWORDS:
-                if kw in val_str: return True
-            return False
-        df['Is_Offline'] = df['Process_Type'].apply(check_offline)
+            for kw, category_name in OFFLINE_MAPPING.items():
+                if kw in val_str:
+                    return category_name # 回傳具體的線外分類名稱
+            return "Online" # 線上
         
-        # ★★★ 修改 3: 通用指定產線判斷 (支援 Line 1 ~ Line N) ★★★
-        def get_target_line(val):
+        df['Process_Category'] = df['Process_Type'].apply(check_offline_type)
+        df['Is_Offline'] = df['Process_Category'] != "Online"
+
+        # ★★★ 修改 2: 欄位邏輯分流 (急單) ★★★
+        # 若有[急單]欄位，優先看該欄位，否則看[備註]
+        if 'Rush_Col' in df.columns:
+            df['Is_Rush'] = df['Rush_Col'].astype(str).str.contains('急單', na=False)
+        else:
+            df['Is_Rush'] = df['Remarks'].astype(str).str.contains('急單', na=False)
+
+        # ★★★ 修改 2: 欄位邏輯分流 (指定線) ★★★
+        # 若有[指定線]欄位，優先看該欄位，否則看[備註]
+        def extract_line_num(val):
             val_str = str(val).upper().replace(' ', '')
-            # 使用正則表達式尋找 LINE 後面的數字
             match = re.search(r'LINE(\d+)', val_str)
             if match:
-                try:
-                    return int(match.group(1))
-                except:
-                    return 0
-            return 0 
-        df['Target_Line'] = df['Remarks'].apply(get_target_line)
+                try: return int(match.group(1))
+                except: return 0
+            return 0
 
-        # 解析備註欄的順序 (Sequence)
+        if 'Line_Col' in df.columns:
+            df['Target_Line'] = df['Line_Col'].apply(extract_line_num)
+        else:
+            df['Target_Line'] = df['Remarks'].apply(extract_line_num)
+
+        # ★★★ 修改 2: 欄位邏輯分流 (備註 - 順序) ★★★
+        # 順序一律看[備註]欄位 (尋找數字)
         def get_sequence(val):
             try:
-                # 尋找字串中的第一個數字 (例如 "1", "備註1", "Step 1" -> 1)
                 match = re.search(r'\d+', str(val))
-                if match:
-                    return int(match.group())
+                if match: return int(match.group())
                 return 0 
             except: return 0
         df['Sequence'] = df['Remarks'].apply(get_sequence)
@@ -208,7 +231,7 @@ def load_and_clean_data(uploaded_file):
     except Exception as e:
         return None, str(e)
 
-# 修改後的排程核心
+# 排程核心
 def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings):
     MAX_MINUTES = 14 * 24 * 60 
     
@@ -227,7 +250,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     results = []
     line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
     
-    # 追蹤完工時間字典 (Order_ID, Sequence) -> Finish_Time
+    # 追蹤完工時間 (Order_ID, Sequence) -> Finish_Time
     order_finish_times = {}
 
     # --- Phase 1: 流水線 (Online) ---
@@ -240,20 +263,11 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         total_weight = (group_df['Manpower_Req'] * 1000 + group_df['Total_Man_Minutes']).sum()
         target_lines = group_df['Target_Line'].unique()
         
-        # ★★★ 修改 3: 通用指定產線邏輯 ★★★
-        # 找出所有大於0的指定產線
         specific_requests = [t for t in target_lines if t > 0]
         if specific_requests:
-            # 如果有指定，只排指定的產線 (取第一個有效的，並轉為 0-based index)
-            # 注意：要確保指定的產線號碼不超過系統設定的 total_lines
             valid_reqs = [t-1 for t in specific_requests if t <= total_lines]
-            if valid_reqs:
-                candidate_lines = valid_reqs
-            else:
-                # 指定了不存在的產線 (如 total=5 但指定 Line 8)，退回預設
-                candidate_lines = [i for i in range(total_lines)]
+            candidate_lines = valid_reqs if valid_reqs else [i for i in range(total_lines)]
         else:
-            # 沒指定，全開
             candidate_lines = [i for i in range(total_lines)]
 
         batches.append({
@@ -270,9 +284,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         candidate_lines = batch['candidate_lines']
         batch_df = batch['df']
         best_line_choice = None 
-        
-        # 這裡的邏輯是找出「整個 Batch」的最佳起始產線
-        # 但 Batch 內個別工單可能有 Sequence 限制，這會在後面實際排入時檢查
         
         for line_idx in candidate_lines:
             curr_mask = line_masks[line_idx]
@@ -328,20 +339,16 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                 total_work = this_setup + prod_duration
                 found_slot = False
                 
-                # ★★★ 修改 2: 線上工單也要檢查前置工序 (Sequence Check) ★★★
+                # Sequence Check
                 seq = row['Sequence']
                 order_id = str(row['Order_ID'])
                 min_start_from_dep = 0
-                
                 if seq > 1:
                     prev_seq = seq - 1
-                    # 檢查上一道工序是否已完工 (無論它是線上還是線外)
                     if (order_id, prev_seq) in order_finish_times:
                         min_start_from_dep = order_finish_times[(order_id, prev_seq)]
 
-                # 搜尋起點：必須同時晚於「產線目前空閒時間」與「前置工序完工時間」
                 t_scan = max(current_t, line_free_time[target_line_idx], min_start_from_dep)
-                
                 real_start, real_end = -1, -1
                 
                 while not found_slot and t_scan < MAX_MINUTES - total_work:
@@ -369,7 +376,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     current_t = real_end
                     line_free_time[target_line_idx] = real_end 
                     
-                    # 記錄完工時間
                     order_finish_times[(str(row['Order_ID']), row['Sequence'])] = real_end
 
                     results.append({
@@ -392,15 +398,17 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         total_man_minutes = float(row['Total_Man_Minutes'])
         prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
         
+        # ★★★ 取得該工單的具體線外名稱 ★★★
+        offline_line_name = row['Process_Category']
+
         if manpower > total_manpower:
-             results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': '線外專區'})
+             results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': offline_line_name})
              continue
         
         # Dependency Check
         seq = row['Sequence']
         order_id = str(row['Order_ID'])
         min_start_time = 480 
-        
         if seq > 1:
             prev_seq = seq - 1
             if (order_id, prev_seq) in order_finish_times:
@@ -433,19 +441,17 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         if found:
             mask_slice = curr_mask[best_start:best_end]
             timeline_manpower[best_start:best_end][mask_slice] += manpower
-            
-            # 記錄完工時間
             order_finish_times[(str(row['Order_ID']), row['Sequence'])] = best_end
 
             results.append({
-                '產線': '線外專區', 
+                '產線': offline_line_name, # 使用分類後的名稱
                 '工單': row['Order_ID'], '產品': row['Product_ID'], '備註': row['Remarks'],
                 '數量': row['Qty'], '類別': '線外', '換線(分)': 0,
                 '需求人力': manpower, '預計開始': format_time_str(best_start),
                 '完工時間': format_time_str(best_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': best_end
             })
         else:
-             results.append({'工單': row['Order_ID'], '狀態': '失敗(找不到空檔)', '產線': '線外專區'})
+             results.append({'工單': row['Order_ID'], '狀態': '失敗(找不到空檔)', '產線': offline_line_name})
 
 
     if results:
@@ -492,7 +498,7 @@ with st.sidebar:
             })
 
     st.markdown("---")
-    st.info("💡 說明：\n1. 支援所有產線指定 (如 Line 1)。\n2. 備註欄數字 (1, 2) 代表工序，系統會確保順序生產。\n3. 線外製程包含：超音波熔接、LS、PT、PKM。")
+    st.info("💡 邏輯說明：\n1. 線外製程分為：組裝前LS、超音波熔接、線邊組裝、PT。\n2. 備註欄數字 (1, 2) 代表工序，系統會確保順序生產。\n3. 優先讀取[急單]與[指定線]獨立欄位，若無則讀取[備註]。")
 
 uploaded_file = st.file_uploader("📂 請上傳工單 Excel 檔案", type=["xlsx", "xls"])
 
