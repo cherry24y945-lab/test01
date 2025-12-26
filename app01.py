@@ -12,7 +12,7 @@ import re  # 用於解析備註欄的數字與產線
 SYSTEM_VERSION = "v5.5 (Universal Dependency & Line Assign)"
 
 # ★★★ 修改 1: 更新線外關鍵字清單 ★★★
-OFFLINE_KEYWORDS = ["超音波熔接", "裝配前雷射(LS)", "PT", "裝配前組裝(PKM)"]
+OFFLINE_KEYWORDS = ["超音波熔接", "線邊雷射", "PT", "線邊組裝"]
 
 def get_base_model(product_id):
     if pd.isna(product_id): return ""
