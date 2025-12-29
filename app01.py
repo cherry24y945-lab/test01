@@ -107,3 +107,60 @@ def calculate_daily_efficiency(timeline_manpower, line_masks, total_manpower, da
         efficiency = (utilized / total_capacity * 100) if total_capacity > 0 else 0
         
         if standard_work_mins > 0:
+            diff = suggested_manpower - total_manpower
+            suggestion = f"需增加 {diff} 人" if diff > 0 else (f"可減少 {abs(diff)} 人" if diff < 0 else "人力完美")
+            
+            efficiency_records.append({
+                '日期': f'D{day+1}', 
+                '當日標準工時(分)': standard_work_mins, 
+                '現有人力': total_manpower,
+                '建議人力(95%效)': suggested_manpower,
+                '調度建議': suggestion,
+                '實際產出人時': utilized,
+                '全廠效率(%)': round(efficiency, 2)
+            })
+    return pd.DataFrame(efficiency_records)
+
+def calculate_line_utilization(line_usage_matrix, line_masks, total_lines, days_to_analyze=5):
+    utilization_records = []
+    for day in range(days_to_analyze):
+        day_start = day * 1440
+        day_end = (day + 1) * 1440
+        row = {'日期': f'D{day+1}'}
+        for i in range(total_lines):
+            available_mask = line_masks[i][day_start:day_end]
+            available_mins = np.sum(available_mask)
+            busy_mask = line_usage_matrix[i][day_start:day_end]
+            valid_busy_mask = busy_mask & available_mask
+            busy_mins = np.sum(valid_busy_mask)
+            if available_mins > 0:
+                util_rate = (busy_mins / available_mins) * 100
+                row[f'Line {i+1} (%)'] = round(util_rate, 1)
+            else:
+                row[f'Line {i+1} (%)'] = "-"
+        if any(v != "-" for k, v in row.items() if k != '日期'):
+            utilization_records.append(row)
+    return pd.DataFrame(utilization_records)
+
+def load_and_clean_data(uploaded_file):
+    try:
+        df = pd.read_excel(uploaded_file)
+        df.columns = df.columns.astype(str).str.replace('\n', '').str.replace(' ', '')
+        
+        col_map = {}
+        for col in df.columns:
+            if '工單' in col: col_map['Order_ID'] = col
+            elif '產品編號' in col: col_map['Product_ID'] = col
+            elif '預定裝配' in col: col_map['Plan_Qty'] = col
+            elif '實際裝配' in col: col_map['Actual_Qty'] = col
+            elif '標準人數' in col: col_map['Manpower_Req'] = col
+            elif '工時(分)' in col or '組裝工時' in col: col_map['Total_Man_Minutes'] = col
+            elif '項次' in col: col_map['Priority'] = col
+            elif '已領料' in col: col_map['Process_Type'] = col
+            elif '備註' in col: col_map['Remarks'] = col
+            elif '急單' in col: col_map['Rush_Col'] = col
+            elif '指定線' in col: col_map['Line_Col'] = col
+            
+        df = df.rename(columns={v: k for k, v in col_map.items()})
+        
+        if 'Total_Man_Minutes' not in df.columns: return None, "錯誤：缺少
