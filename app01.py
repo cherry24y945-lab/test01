@@ -9,10 +9,9 @@ import re
 # ==========================================
 # 1. 核心邏輯區
 # ==========================================
-SYSTEM_VERSION = "v5.6 (Multi-Column Logic & Categorized Offline)"
+SYSTEM_VERSION = "v5.6.1 (BugFix: KeyError & Stability)"
 
-# ★★★ 修改 1: 線外製程分類對照表 (關鍵字 -> 顯示名稱) ★★★
-# 系統會依序檢查製程名稱是否包含 Key，若有則歸類為 Value
+# 線外製程分類對照表
 OFFLINE_MAPPING = {
     "超音波熔接": "線外-超音波熔接",
     "LS": "線外-組裝前LS",
@@ -185,21 +184,18 @@ def load_and_clean_data(uploaded_file):
             val_str = str(val)
             for kw, category_name in OFFLINE_MAPPING.items():
                 if kw in val_str:
-                    return category_name # 回傳具體的線外分類名稱
-            return "Online" # 線上
+                    return category_name 
+            return "Online" 
         
         df['Process_Category'] = df['Process_Type'].apply(check_offline_type)
         df['Is_Offline'] = df['Process_Category'] != "Online"
 
-        # ★★★ 修改 2: 欄位邏輯分流 (急單) ★★★
-        # 若有[急單]欄位，優先看該欄位，否則看[備註]
+        # 優先讀取獨立欄位，否則回退到備註
         if 'Rush_Col' in df.columns:
             df['Is_Rush'] = df['Rush_Col'].astype(str).str.contains('急單', na=False)
         else:
             df['Is_Rush'] = df['Remarks'].astype(str).str.contains('急單', na=False)
 
-        # ★★★ 修改 2: 欄位邏輯分流 (指定線) ★★★
-        # 若有[指定線]欄位，優先看該欄位，否則看[備註]
         def extract_line_num(val):
             val_str = str(val).upper().replace(' ', '')
             match = re.search(r'LINE(\d+)', val_str)
@@ -213,8 +209,6 @@ def load_and_clean_data(uploaded_file):
         else:
             df['Target_Line'] = df['Remarks'].apply(extract_line_num)
 
-        # ★★★ 修改 2: 欄位邏輯分流 (備註 - 順序) ★★★
-        # 順序一律看[備註]欄位 (尋找數字)
         def get_sequence(val):
             try:
                 match = re.search(r'\d+', str(val))
@@ -246,7 +240,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     results = []
     line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
     
-    # 追蹤完工時間 (Order_ID, Sequence) -> Finish_Time
     order_finish_times = {}
 
     # --- Phase 1: 流水線 (Online) ---
@@ -335,7 +328,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                 total_work = this_setup + prod_duration
                 found_slot = False
                 
-                # Sequence Check
                 seq = row['Sequence']
                 order_id = str(row['Order_ID'])
                 min_start_from_dep = 0
@@ -376,10 +368,14 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
 
                     results.append({
                         '產線': f"Line {target_line_idx+1}", 
-                        '工單': row['Order_ID'], '產品': row['Product_ID'], '急單': row['Rush_Col'],
+                        '工單': row['Order_ID'], '產品': row['Product_ID'], 
                         '數量': row['Qty'], '類別': '流水線', '換線(分)': this_setup,
                         '需求人力': manpower, '預計開始': format_time_str(real_start),
-                        '完工時間': format_time_str(real_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': real_end, '備註': row['Remarks'], '指定線': row['Line_Col']
+                        '完工時間': format_time_str(real_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': real_end,
+                        # ★★★ 修復 Key Error: 使用 .get() 確保欄位存在 ★★★
+                        '備註': row.get('Remarks', ''), 
+                        '指定線': row.get('Line_Col', ''), 
+                        '急單': row.get('Rush_Col', '')
                     })
                 else:
                     results.append({'工單': row['Order_ID'], '狀態': '失敗(資源不足)', '產線': f"Line {target_line_idx+1}"})
@@ -394,14 +390,12 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         total_man_minutes = float(row['Total_Man_Minutes'])
         prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
         
-        # ★★★ 取得該工單的具體線外名稱 ★★★
         offline_line_name = row['Process_Category']
 
         if manpower > total_manpower:
              results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': offline_line_name})
              continue
         
-        # Dependency Check
         seq = row['Sequence']
         order_id = str(row['Order_ID'])
         min_start_time = 480 
@@ -440,11 +434,15 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             order_finish_times[(str(row['Order_ID']), row['Sequence'])] = best_end
 
             results.append({
-                '產線': offline_line_name, # 使用分類後的名稱
-                '工單': row['Order_ID'], '產品': row['Product_ID'], '備註': row['Remarks'],
+                '產線': offline_line_name,
+                '工單': row['Order_ID'], '產品': row['Product_ID'], 
                 '數量': row['Qty'], '類別': '線外', '換線(分)': 0,
                 '需求人力': manpower, '預計開始': format_time_str(best_start),
-                '完工時間': format_time_str(best_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': best_end
+                '完工時間': format_time_str(best_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': best_end,
+                # ★★★ 修復 Key Error ★★★
+                '備註': row.get('Remarks', ''),
+                '指定線': row.get('Line_Col', ''),
+                '急單': row.get('Rush_Col', '')
             })
         else:
              results.append({'工單': row['Order_ID'], '狀態': '失敗(找不到空檔)', '產線': offline_line_name})
