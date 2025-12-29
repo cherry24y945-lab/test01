@@ -7,12 +7,11 @@ import math
 import re
 
 # ==========================================
-# 1. 核心邏輯區
+# 1. 核心邏輯與輔助函數區
 # ==========================================
-SYSTEM_VERSION = "v5.7.1 (Fix: Syntax & Resource Overlap)"
+SYSTEM_VERSION = "v5.7.2 (Structure Refactored & Stable)"
 
 # 線外製程分類與資源限制設定
-# 邏輯：(顯示名稱, 最大並行工單數)
 OFFLINE_CONFIG = {
     # 1. 超音波熔接 (限制 1 站) -> 絕對單工
     "超音波": ("線外-超音波熔接", 1), 
@@ -66,6 +65,31 @@ def format_time_str(minute_idx):
     hh = m_of_day // 60
     mm = m_of_day % 60
     return f"D{d} {hh:02d}:{mm:02d}"
+
+# 線外分類函數 (移至全域)
+def categorize_offline(val):
+    val_str = str(val)
+    for kw, (name, limit) in OFFLINE_CONFIG.items():
+        if kw in val_str:
+            return name, limit
+    return "Online", -1
+
+# 指定線提取函數 (移至全域)
+def extract_line_num(val):
+    val_str = str(val).upper().replace(' ', '')
+    match = re.search(r'LINE(\d+)', val_str)
+    if match:
+        try: return int(match.group(1))
+        except: return 0
+    return 0
+
+# 順序提取函數 (移至全域)
+def get_sequence(val):
+    try:
+        match = re.search(r'\d+', str(val))
+        if match: return int(match.group())
+        return 0 
+    except: return 0
 
 def analyze_idle_manpower(timeline_manpower, work_masks, total_manpower, max_sim_minutes):
     global_work_mask = np.zeros(max_sim_minutes, dtype=bool)
@@ -193,57 +217,27 @@ def load_and_clean_data(uploaded_file):
         df = df[(df['Qty'] > 0) & (df['Manpower_Req'] > 0)]
         df['Base_Model'] = df['Product_ID'].apply(get_base_model)
         
-        # 線外分類與資源標記
-        def categorize_offline(val):
-            val_str = str(val)
-            for kw, (name, limit) in OFFLINE_CONFIG.items():
-                if kw in val_str:
-                    return name, limit
-            return "Online", -1
-        
-        # 修正：確保 apply 返回的是 series of tuples
+        # 線外分類與資源標記 (使用全域函數)
         temp_res = df['Process_Type'].apply(categorize_offline)
-        
-        # 拆分 tuple
         df['Process_Category'] = temp_res.apply(lambda x: x[0])
         df['Concurrency_Limit'] = temp_res.apply(lambda x: x[1])
         df['Is_Offline'] = df['Process_Category'] != "Online"
 
-        # 急單優先權
-        if 'Rush_Col' in df.columns:
-            df['Is_Rush'] = df['Rush_Col'].astype(str).str.contains('急單', na=False)
-        else:
-            df['Is_Rush'] = df['Remarks'].astype(str).str.contains('急單', na=False)
-
-        # 指定線判斷
-        def extract_line_num(val):
-            val_str = str(val).upper().replace(' ', '')
-            match = re.search(r'LINE(\d+)', val_str)
-            if match:
-                try: return int(match.group(1))
-                except: return 0
-            return 0
-
-        if 'Line_Col' in df.columns:
-            df['Target_Line'] = df['Line_Col'].apply(extract_line_num)
-        else:
-            df['Target_Line'] = df['Remarks'].apply(extract_line_num)
-        
-        mask_no_line = df['Target_Line'] == 0
-        df.loc[mask_no_line, 'Target_Line'] = df.loc[mask_no_line, 'Remarks'].apply(extract_line_num)
-
-        # 工序順序
-        def get_sequence(val):
-            try:
-                match = re.search(r'\d+', str(val))
-                if match: return int(match.group())
-                return 0 
-            except: return 0
-        df['Sequence'] = df['Remarks'].apply(get_sequence)
-        
+        # 強制初始化欄位
         if 'Rush_Col' not in df.columns: df['Rush_Col'] = ''
         if 'Line_Col' not in df.columns: df['Line_Col'] = ''
 
+        # 急單優先權
+        df['Is_Rush'] = df['Rush_Col'].astype(str).str.contains('急單', na=False) | df['Remarks'].astype(str).str.contains('急單', na=False)
+
+        # 指定線判斷 (使用全域函數)
+        df['Target_Line'] = df['Line_Col'].apply(extract_line_num)
+        mask_no_line = df['Target_Line'] == 0
+        df.loc[mask_no_line, 'Target_Line'] = df.loc[mask_no_line, 'Remarks'].apply(extract_line_num)
+
+        # 工序順序 (使用全域函數)
+        df['Sequence'] = df['Remarks'].apply(get_sequence)
+        
         return df, None
     except Exception as e:
         return None, str(e)
@@ -267,9 +261,8 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     results = []
     line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
     
-    # 線外資源佔用表: Key="線外-超音波熔接-1"
+    # 線外資源佔用表
     offline_resource_usage = {}
-    
     order_finish_times = {}
 
     # --- Phase 1: 流水線 (Online) ---
@@ -450,7 +443,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             if (order_id, prev_seq) in order_finish_times:
                 min_start_time = order_finish_times[(order_id, prev_seq)]
         
-        best_choice = None # (start_time, end_time, station_id)
+        best_choice = None
         stations_to_try = candidate_stations if candidate_stations else [None]
         
         for station_id in stations_to_try:
