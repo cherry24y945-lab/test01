@@ -164,7 +164,7 @@ def load_and_clean_data(uploaded_file):
         df = df.rename(columns={v: k for k, v in col_map.items()})
         
         # ★★★ BugFix: 修正字串結尾的引號問題 ★★★
-        if 'Total_Man_Minutes' not in df.columns: return None= '錯誤：缺少「工時(分)」欄位'
+        if 'Total_Man_Minutes' not in df.columns: return None, "錯誤：缺少「工時(分)」欄位"
         
         if 'Process_Type' not in df.columns: df['Process_Type'] = '組裝'
         if 'Remarks' not in df.columns: df['Remarks'] = ''
@@ -522,3 +522,40 @@ if uploaded_file is not None:
                     changeover_mins, 
                     line_settings_from_ui
                 )
+                
+                st.success("✅ 排程運算完成！")
+                
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    df_schedule.to_excel(writer, sheet_name='生產排程', index=False)
+                    df_efficiency.to_excel(writer, sheet_name='每日效率分析', index=False)
+                    df_utilization.to_excel(writer, sheet_name='各線稼動率', index=False)
+                    df_idle.to_excel(writer, sheet_name='閒置人力明細', index=False)
+                output.seek(0)
+                
+                st.download_button(
+                    label="📥 下載完整排程報表 (Excel)",
+                    data=output,
+                    file_name=f'AI_Schedule_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+                
+                tab1, tab2, tab3 = st.tabs(["📊 生產排程表", "📈 效率分析", "⚠️ 閒置人力"])
+                
+                with tab1:
+                    st.dataframe(df_schedule, use_container_width=True)
+                
+                with tab2:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.subheader("每日效率")
+                        st.dataframe(df_efficiency)
+                    with col2:
+                        st.subheader("產線稼動率")
+                        st.dataframe(df_utilization)
+                        
+                with tab3:
+                    st.dataframe(df_idle, use_container_width=True)
+
+else:
+    st.info("👈 請從左側開始設定參數，再上傳檔案。")
