@@ -164,7 +164,7 @@ def load_and_clean_data(uploaded_file):
         df = df.rename(columns={v: k for k, v in col_map.items()})
         
         # ★★★ BugFix: 修正字串結尾的引號問題 ★★★
-        if 'Total_Man_Minutes' not in df.columns: return None, '錯誤：缺少「工時(分)」欄位'
+        if 'Total_Man_Minutes' not in df.columns: return None= '錯誤：缺少「工時(分)」欄位'
         
         if 'Process_Type' not in df.columns: df['Process_Type'] = '組裝'
         if 'Remarks' not in df.columns: df['Remarks'] = ''
