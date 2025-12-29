@@ -9,14 +9,18 @@ import re
 # ==========================================
 # 1. 核心邏輯區
 # ==========================================
-SYSTEM_VERSION = "v5.6.6 (Final Stable: Auto-Fill Missing Cols)"
+SYSTEM_VERSION = "v5.6.7 (Offline Capacity Constraints)"
 
-# 線外製程分類對照表
-OFFLINE_MAPPING = {
-    "超音波熔接": "線外-超音波熔接",
-    "LS": "線外-組裝前LS",
-    "PT": "線外-PT",
-    "裝配前組裝(PKM)": "線外-線邊組裝"
+# 線外製程分類與資源限制設定
+# value: (顯示名稱, 最大並行工單數)
+# 0 表示無工單數限制（只受人力限制），1 表示單一工單，2 表示雙工單並行
+OFFLINE_CONFIG = {
+    "超音波熔接": ("線外-超音波熔接", 1),
+    "LS": ("線外-組裝前LS", 2),
+    "雷射": ("線外-組裝前LS", 2), # 兼容舊稱
+    "PT": ("線外-PT", 1),
+    "PKM": ("線外-線邊組裝", 2),
+    "AS": ("線外-線邊組裝", 2)
 }
 
 def get_base_model(product_id):
@@ -163,13 +167,9 @@ def load_and_clean_data(uploaded_file):
             
         df = df.rename(columns={v: k for k, v in col_map.items()})
         
-        # 修正單行字串截斷問題
         if 'Total_Man_Minutes' not in df.columns: 
             return None, "錯誤：缺少[工時(分)]欄位"
         
-        # ★★★ BugFix: 強制初始化缺失欄位，避免 KeyError ★★★
-        if 'Rush_Col' not in df.columns: df['Rush_Col'] = ''
-        if 'Line_Col' not in df.columns: df['Line_Col'] = ''
         if 'Process_Type' not in df.columns: df['Process_Type'] = '組裝'
         if 'Remarks' not in df.columns: df['Remarks'] = ''
         
@@ -184,19 +184,25 @@ def load_and_clean_data(uploaded_file):
         df = df[(df['Qty'] > 0) & (df['Manpower_Req'] > 0)]
         df['Base_Model'] = df['Product_ID'].apply(get_base_model)
         
-        # 線外分類
-        def check_offline_type(val):
+        # 線外分類與資源標記
+        def categorize_offline(val):
             val_str = str(val)
-            for kw, category_name in OFFLINE_MAPPING.items():
+            for kw, (name, limit) in OFFLINE_CONFIG.items():
                 if kw in val_str:
-                    return category_name 
-            return "Online" 
+                    return name, limit
+            return "Online", -1
         
-        df['Process_Category'] = df['Process_Type'].apply(check_offline_type)
+        # 拆分出兩個欄位：類別名稱、並行限制
+        temp_res = df['Process_Type'].apply(categorize_offline)
+        df['Process_Category'] = temp_res.apply(lambda x: x[0])
+        df['Concurrency_Limit'] = temp_res.apply(lambda x: x[1])
         df['Is_Offline'] = df['Process_Category'] != "Online"
 
-        # 急單優先權：若欄位為空則看備註
-        df['Is_Rush'] = df['Rush_Col'].astype(str).str.contains('急單', na=False) | df['Remarks'].astype(str).str.contains('急單', na=False)
+        # 急單優先權
+        if 'Rush_Col' in df.columns:
+            df['Is_Rush'] = df['Rush_Col'].astype(str).str.contains('急單', na=False)
+        else:
+            df['Is_Rush'] = df['Remarks'].astype(str).str.contains('急單', na=False)
 
         # 指定線判斷
         def extract_line_num(val):
@@ -207,9 +213,12 @@ def load_and_clean_data(uploaded_file):
                 except: return 0
             return 0
 
-        # 合併欄位判斷：優先看 Line_Col，如果沒有則看 Remarks
-        df['Target_Line'] = df['Line_Col'].apply(extract_line_num)
-        # 如果 Line_Col 沒抓到 (0)，再試試看 Remarks
+        if 'Line_Col' in df.columns:
+            df['Target_Line'] = df['Line_Col'].apply(extract_line_num)
+        else:
+            df['Target_Line'] = df['Remarks'].apply(extract_line_num)
+        
+        # 補強：若指定線無效，再看備註
         mask_no_line = df['Target_Line'] == 0
         df.loc[mask_no_line, 'Target_Line'] = df.loc[mask_no_line, 'Remarks'].apply(extract_line_num)
 
@@ -222,6 +231,10 @@ def load_and_clean_data(uploaded_file):
             except: return 0
         df['Sequence'] = df['Remarks'].apply(get_sequence)
         
+        # 強制補齊缺失欄位以防報錯
+        if 'Rush_Col' not in df.columns: df['Rush_Col'] = ''
+        if 'Line_Col' not in df.columns: df['Line_Col'] = ''
+
         return df, None
     except Exception as e:
         return None, str(e)
@@ -245,6 +258,11 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     results = []
     line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
     
+    # ★★★ 新增：線外資源佔用表 (Resource ID -> Boolean Array) ★★★
+    # 用於控制超音波(1台)與LS(2台)的佔用
+    # Key: "線外-超音波熔接-1", "線外-組裝前LS-1", "線外-組裝前LS-2"
+    offline_resource_usage = {}
+    
     order_finish_times = {}
 
     # --- Phase 1: 流水線 (Online) ---
@@ -265,7 +283,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         else:
             candidate_lines = [i for i in range(total_lines)]
 
-        # 批次內排序
         sorted_df = group_df.sort_values(by=['Is_Rush', 'Priority'], ascending=[False, True])
 
         batches.append({
@@ -276,7 +293,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             'candidate_lines': candidate_lines
         })
     
-    # 批次排序
     batches.sort(key=lambda x: (x['is_rush'], x['weight']), reverse=True)
     
     for batch_idx, batch in enumerate(batches):
@@ -401,12 +417,28 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         total_man_minutes = float(row['Total_Man_Minutes'])
         prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
         
-        offline_line_name = row['Process_Category']
+        offline_category = row['Process_Category']
+        concurrency_limit = row['Concurrency_Limit']
+        
+        # 決定要使用的資源站點 (Stations)
+        # 如果是 0 (無限)，就不用檢查資源佔用，只檢查人力
+        # 如果是 1 (超音波)，只有一個站點 "線外-超音波熔接-1"
+        # 如果是 2 (LS)，有兩個站點 "線外-組裝前LS-1", "線外-組裝前LS-2"
+        candidate_stations = []
+        if concurrency_limit == 0:
+            pass # 無須資源檢查
+        else:
+            for i in range(1, concurrency_limit + 1):
+                res_id = f"{offline_category}-{i}"
+                if res_id not in offline_resource_usage:
+                    offline_resource_usage[res_id] = np.zeros(MAX_MINUTES, dtype=bool)
+                candidate_stations.append(res_id)
 
         if manpower > total_manpower:
-             results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': offline_line_name})
+             results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': offline_category})
              continue
         
+        # Dependency Check
         seq = row['Sequence']
         order_id = str(row['Order_ID'])
         min_start_time = 480 
@@ -415,47 +447,86 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             if (order_id, prev_seq) in order_finish_times:
                 min_start_time = order_finish_times[(order_id, prev_seq)]
         
-        found = False
-        t_search = max(480, min_start_time)
-        best_start, best_end = -1, -1
+        # 尋找最佳站點與時間
+        best_choice = None # (start_time, end_time, station_id)
 
-        while not found and t_search < MAX_MINUTES - prod_duration:
-            if not curr_mask[t_search]:
-                t_search += 1
-                continue
-            
-            s_val = curr_cumsum[t_search]
-            t_val = s_val + prod_duration
-            if t_val > curr_cumsum[-1]: break
-            t_end = np.searchsorted(curr_cumsum, t_val)
-            
-            i_mask = curr_mask[t_search:t_end]
-            current_max_used = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
-            
-            if current_max_used + manpower <= total_manpower:
-                best_start = t_search
-                best_end = t_end
-                found = True
-            else:
-                t_search += 5 
+        # 若有限制資源，嘗試所有站點，找最早能塞進去的
+        stations_to_try = candidate_stations if candidate_stations else [None]
         
-        if found:
-            mask_slice = curr_mask[best_start:best_end]
-            timeline_manpower[best_start:best_end][mask_slice] += manpower
-            order_finish_times[(str(row['Order_ID']), row['Sequence'])] = best_end
+        for station_id in stations_to_try:
+            # 決定該站點的佔用時間軸
+            if station_id:
+                res_usage_mask = offline_resource_usage[station_id]
+            
+            found = False
+            t_search = max(480, min_start_time)
+            
+            while not found and t_search < MAX_MINUTES - prod_duration:
+                if not curr_mask[t_search]:
+                    t_search += 1
+                    continue
+                
+                # 檢查資源是否被佔用 (若有 station_id)
+                if station_id:
+                    # 快速檢查區間內是否有 True
+                    # 注意：這裡要預判結束時間，但結束時間取決於 mask 的有效工時
+                    # 簡化：先算結束時間，再檢查這段區間資源有沒有被用掉
+                    # 這種方式比較準確
+                    pass
+
+                s_val = curr_cumsum[t_search]
+                t_val = s_val + prod_duration
+                if t_val > curr_cumsum[-1]: break
+                t_end = np.searchsorted(curr_cumsum, t_val)
+                
+                # 檢查人力
+                i_mask = curr_mask[t_search:t_end]
+                current_max_used = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
+                
+                # 檢查資源佔用 (Resource Availability Check)
+                resource_conflict = False
+                if station_id:
+                    if np.any(res_usage_mask[t_search:t_end]):
+                        resource_conflict = True
+                
+                if (current_max_used + manpower <= total_manpower) and (not resource_conflict):
+                    # 找到空檔了！
+                    # 如果這是第一個找到的，或是比之前的更早，就選它
+                    if best_choice is None or t_search < best_choice[0]:
+                        best_choice = (t_search, t_end, station_id)
+                    found = True # 針對這個 station 已經找到最早的了，不用往後找
+                else:
+                    t_search += 5 
+        
+        # 確定排入
+        if best_choice:
+            final_start, final_end, final_station = best_choice
+            
+            # 更新人力
+            mask_slice = curr_mask[final_start:final_end]
+            timeline_manpower[final_start:final_end][mask_slice] += manpower
+            
+            # 更新資源
+            if final_station:
+                offline_resource_usage[final_station][final_start:final_end] = True
+                display_line_name = final_station # 顯示例如 "線外-組裝前LS-1"
+            else:
+                display_line_name = offline_category # 沒限制就顯示原名
+
+            order_finish_times[(str(row['Order_ID']), row['Sequence'])] = final_end
 
             results.append({
-                '產線': offline_line_name,
+                '產線': display_line_name,
                 '工單': row['Order_ID'], '產品': row['Product_ID'], 
                 '數量': row['Qty'], '類別': '線外', '換線(分)': 0,
-                '需求人力': manpower, '預計開始': format_time_str(best_start),
-                '完工時間': format_time_str(best_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': best_end,
+                '需求人力': manpower, '預計開始': format_time_str(final_start),
+                '完工時間': format_time_str(final_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': final_end,
                 '備註': row.get('Remarks', ''),
                 '指定線': row.get('Line_Col', ''),
                 '急單': 'Yes' if row.get('Is_Rush') else ''
             })
         else:
-             results.append({'工單': row['Order_ID'], '狀態': '失敗(找不到空檔)', '產線': offline_line_name})
+             results.append({'工單': row['Order_ID'], '狀態': '失敗(資源或人力不足)', '產線': offline_line_name})
 
 
     if results:
@@ -517,7 +588,7 @@ if uploaded_file is not None:
             st.dataframe(df_clean.head())
             
         if st.button("🚀 開始 AI 排程運算", type="primary"):
-            with st.spinner('正在進行百萬次模擬運算 (包含全工序相依性檢查)...請稍候...'):
+            with st.spinner('正在進行百萬次模擬運算 (包含產能與工序檢查)...請稍候...'):
                 df_schedule, df_idle, df_efficiency, df_utilization = run_scheduler(
                     df_clean, 
                     total_manpower, 
