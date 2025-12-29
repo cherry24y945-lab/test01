@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數 (Global Helpers)
 # ==========================================
-SYSTEM_VERSION = "v5.7.3 (Final UI Fix: LINE4-LINE8)"
+SYSTEM_VERSION = "v5.7.4 (UI Fix: Absolute LINE4-LINE8)"
 
 # 線外製程分類與資源限制設定
 OFFLINE_CONFIG = {
