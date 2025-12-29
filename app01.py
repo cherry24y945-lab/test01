@@ -379,7 +379,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                         '工單': row['Order_ID'], '產品': row['Product_ID'], '急單': row['Rush_Col'],
                         '數量': row['Qty'], '類別': '流水線', '換線(分)': this_setup,
                         '需求人力': manpower, '預計開始': format_time_str(real_start),
-                        '完工時間': format_time_str(real_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': real_end, '備註': row['Remarks'], '指定線': row['Line_Co']
+                        '完工時間': format_time_str(real_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': real_end, '備註': row['Remarks'], '指定線': row['Line_Col']
                     })
                 else:
                     results.append({'工單': row['Order_ID'], '狀態': '失敗(資源不足)', '產線': f"Line {target_line_idx+1}"})
