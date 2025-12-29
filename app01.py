@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 核心邏輯區
 # ==========================================
-SYSTEM_VERSION = "v5.6.5 (Fix Syntax & Logic)"
+SYSTEM_VERSION = "v5.6.6 (Final Stable: Auto-Fill Missing Cols)"
 
 # 線外製程分類對照表
 OFFLINE_MAPPING = {
@@ -163,10 +163,13 @@ def load_and_clean_data(uploaded_file):
             
         df = df.rename(columns={v: k for k, v in col_map.items()})
         
-        # ★★★ BugFix: 將單行判斷拆開，避免字串截斷錯誤 ★★★
+        # 修正單行字串截斷問題
         if 'Total_Man_Minutes' not in df.columns: 
             return None, "錯誤：缺少[工時(分)]欄位"
         
+        # ★★★ BugFix: 強制初始化缺失欄位，避免 KeyError ★★★
+        if 'Rush_Col' not in df.columns: df['Rush_Col'] = ''
+        if 'Line_Col' not in df.columns: df['Line_Col'] = ''
         if 'Process_Type' not in df.columns: df['Process_Type'] = '組裝'
         if 'Remarks' not in df.columns: df['Remarks'] = ''
         
@@ -181,7 +184,7 @@ def load_and_clean_data(uploaded_file):
         df = df[(df['Qty'] > 0) & (df['Manpower_Req'] > 0)]
         df['Base_Model'] = df['Product_ID'].apply(get_base_model)
         
-        # 線外分類判斷
+        # 線外分類
         def check_offline_type(val):
             val_str = str(val)
             for kw, category_name in OFFLINE_MAPPING.items():
@@ -192,13 +195,10 @@ def load_and_clean_data(uploaded_file):
         df['Process_Category'] = df['Process_Type'].apply(check_offline_type)
         df['Is_Offline'] = df['Process_Category'] != "Online"
 
-        # 急單優先權：先看獨立欄位，再看備註
-        if 'Rush_Col' in df.columns:
-            df['Is_Rush'] = df['Rush_Col'].astype(str).str.contains('急單', na=False)
-        else:
-            df['Is_Rush'] = df['Remarks'].astype(str).str.contains('急單', na=False)
+        # 急單優先權：若欄位為空則看備註
+        df['Is_Rush'] = df['Rush_Col'].astype(str).str.contains('急單', na=False) | df['Remarks'].astype(str).str.contains('急單', na=False)
 
-        # 指定線判斷：先看獨立欄位，再看備註
+        # 指定線判斷
         def extract_line_num(val):
             val_str = str(val).upper().replace(' ', '')
             match = re.search(r'LINE(\d+)', val_str)
@@ -207,12 +207,13 @@ def load_and_clean_data(uploaded_file):
                 except: return 0
             return 0
 
-        if 'Line_Col' in df.columns:
-            df['Target_Line'] = df['Line_Col'].apply(extract_line_num)
-        else:
-            df['Target_Line'] = df['Remarks'].apply(extract_line_num)
+        # 合併欄位判斷：優先看 Line_Col，如果沒有則看 Remarks
+        df['Target_Line'] = df['Line_Col'].apply(extract_line_num)
+        # 如果 Line_Col 沒抓到 (0)，再試試看 Remarks
+        mask_no_line = df['Target_Line'] == 0
+        df.loc[mask_no_line, 'Target_Line'] = df.loc[mask_no_line, 'Remarks'].apply(extract_line_num)
 
-        # 工序順序：從備註欄抓取數字
+        # 工序順序
         def get_sequence(val):
             try:
                 match = re.search(r'\d+', str(val))
@@ -252,7 +253,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     
     batches = []
     for base_model, group_df in family_groups:
-        # ★ 急單邏輯：急單 Batch 權重加 100萬，確保絕對優先
         is_rush = group_df['Is_Rush'].any() 
         rush_weight = 1000000 if is_rush else 0
         total_work_load = (group_df['Manpower_Req'] * group_df['Total_Man_Minutes']).sum()
@@ -265,7 +265,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         else:
             candidate_lines = [i for i in range(total_lines)]
 
-        # ★ 批次內排序：急單 > 優先權
+        # 批次內排序
         sorted_df = group_df.sort_values(by=['Is_Rush', 'Priority'], ascending=[False, True])
 
         batches.append({
@@ -276,7 +276,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             'candidate_lines': candidate_lines
         })
     
-    # ★ 批次間排序：急單優先
+    # 批次排序
     batches.sort(key=lambda x: (x['is_rush'], x['weight']), reverse=True)
     
     for batch_idx, batch in enumerate(batches):
@@ -383,4 +383,182 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                         '需求人力': manpower, '預計開始': format_time_str(real_start),
                         '完工時間': format_time_str(real_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': real_end,
                         '備註': row.get('Remarks', ''), 
-                        '指定
+                        '指定線': row.get('Line_Col', ''), 
+                        '急單': 'Yes' if row.get('Is_Rush') else ''
+                    })
+                else:
+                    results.append({'工單': row['Order_ID'], '狀態': '失敗(資源不足)', '產線': f"Line {target_line_idx+1}"})
+
+    # --- Phase 2: 線外工單 (Offline) ---
+    df_offline = df[df['Is_Offline'] == True].copy()
+    df_offline = df_offline.sort_values(by=['Is_Rush', 'Priority'], ascending=[False, True])
+    
+    curr_mask = offline_mask
+    curr_cumsum = offline_cumsum
+
+    for _, row in df_offline.iterrows():
+        manpower = int(row['Manpower_Req'])
+        total_man_minutes = float(row['Total_Man_Minutes'])
+        prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
+        
+        offline_line_name = row['Process_Category']
+
+        if manpower > total_manpower:
+             results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': offline_line_name})
+             continue
+        
+        seq = row['Sequence']
+        order_id = str(row['Order_ID'])
+        min_start_time = 480 
+        if seq > 1:
+            prev_seq = seq - 1
+            if (order_id, prev_seq) in order_finish_times:
+                min_start_time = order_finish_times[(order_id, prev_seq)]
+        
+        found = False
+        t_search = max(480, min_start_time)
+        best_start, best_end = -1, -1
+
+        while not found and t_search < MAX_MINUTES - prod_duration:
+            if not curr_mask[t_search]:
+                t_search += 1
+                continue
+            
+            s_val = curr_cumsum[t_search]
+            t_val = s_val + prod_duration
+            if t_val > curr_cumsum[-1]: break
+            t_end = np.searchsorted(curr_cumsum, t_val)
+            
+            i_mask = curr_mask[t_search:t_end]
+            current_max_used = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
+            
+            if current_max_used + manpower <= total_manpower:
+                best_start = t_search
+                best_end = t_end
+                found = True
+            else:
+                t_search += 5 
+        
+        if found:
+            mask_slice = curr_mask[best_start:best_end]
+            timeline_manpower[best_start:best_end][mask_slice] += manpower
+            order_finish_times[(str(row['Order_ID']), row['Sequence'])] = best_end
+
+            results.append({
+                '產線': offline_line_name,
+                '工單': row['Order_ID'], '產品': row['Product_ID'], 
+                '數量': row['Qty'], '類別': '線外', '換線(分)': 0,
+                '需求人力': manpower, '預計開始': format_time_str(best_start),
+                '完工時間': format_time_str(best_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': best_end,
+                '備註': row.get('Remarks', ''),
+                '指定線': row.get('Line_Col', ''),
+                '急單': 'Yes' if row.get('Is_Rush') else ''
+            })
+        else:
+             results.append({'工單': row['Order_ID'], '狀態': '失敗(找不到空檔)', '產線': offline_line_name})
+
+
+    if results:
+        last_time = max([r['排序用'] for r in results if r.get('狀態')=='OK'], default=0)
+        analyze_days = (last_time // 1440) + 1
+    else: last_time, analyze_days = 0, 1
+        
+    df_idle = analyze_idle_manpower(timeline_manpower, line_masks, total_manpower, last_time + 60)
+    df_efficiency = calculate_daily_efficiency(timeline_manpower, line_masks, total_manpower, analyze_days)
+    df_utilization = calculate_line_utilization(line_usage_matrix, line_masks, total_lines, analyze_days)
+    return pd.DataFrame(results), df_idle, df_efficiency, df_utilization
+
+# ==========================================
+# 2. Streamlit 網頁介面設計
+# ==========================================
+
+st.set_page_config(page_title="AI 智能排程系統", layout="wide")
+
+st.title(f"🏭 {SYSTEM_VERSION} - 線上排程平台")
+st.markdown("上傳 Excel 工單，AI 自動幫您規劃產線與人力配置。")
+
+with st.sidebar:
+    st.header("⚙️ 全域參數")
+    total_manpower = st.number_input("全廠總人力 (人)", min_value=1, value=50)
+    total_lines = st.number_input("產線數量 (條)", min_value=1, value=5)
+    changeover_mins = st.number_input("換線時間 (分)", min_value=0, value=30)
+    
+    st.markdown("---")
+    st.header("🕒 各產線工時設定")
+    
+    line_settings_from_ui = []
+    with st.expander("點此展開設定詳細時間", expanded=True):
+        for i in range(total_lines):
+            st.markdown(f"**Line {i+1}**")
+            col1, col2 = st.columns(2)
+            with col1:
+                t_start = st.time_input(f"L{i+1} 開始", value=time(8, 0), key=f"start_{i}")
+            with col2:
+                t_end = st.time_input(f"L{i+1} 結束", value=time(17, 0), key=f"end_{i}")
+            
+            line_settings_from_ui.append({
+                "start": t_start.strftime("%H:%M"), 
+                "end": t_end.strftime("%H:%M")
+            })
+
+    st.markdown("---")
+    st.info("💡 邏輯說明：\n1. 線外製程分為：組裝前LS、超音波熔接、線邊組裝、PT。\n2. 備註欄數字 (1, 2) 代表工序，系統會確保順序生產。\n3. 優先讀取[急單]與[指定線]獨立欄位，若無則讀取[備註]。")
+
+uploaded_file = st.file_uploader("📂 請上傳工單 Excel 檔案", type=["xlsx", "xls"])
+
+if uploaded_file is not None:
+    df_clean, err = load_and_clean_data(uploaded_file)
+    
+    if err:
+        st.error(f"讀取失敗: {err}")
+    else:
+        st.success(f"讀取成功！共 {len(df_clean)} 筆有效工單。")
+        with st.expander("查看原始資料預覽"):
+            st.dataframe(df_clean.head())
+            
+        if st.button("🚀 開始 AI 排程運算", type="primary"):
+            with st.spinner('正在進行百萬次模擬運算 (包含全工序相依性檢查)...請稍候...'):
+                df_schedule, df_idle, df_efficiency, df_utilization = run_scheduler(
+                    df_clean, 
+                    total_manpower, 
+                    total_lines, 
+                    changeover_mins, 
+                    line_settings_from_ui
+                )
+                
+                st.success("✅ 排程運算完成！")
+                
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    df_schedule.to_excel(writer, sheet_name='生產排程', index=False)
+                    df_efficiency.to_excel(writer, sheet_name='每日效率分析', index=False)
+                    df_utilization.to_excel(writer, sheet_name='各線稼動率', index=False)
+                    df_idle.to_excel(writer, sheet_name='閒置人力明細', index=False)
+                output.seek(0)
+                
+                st.download_button(
+                    label="📥 下載完整排程報表 (Excel)",
+                    data=output,
+                    file_name=f'AI_Schedule_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+                
+                tab1, tab2, tab3 = st.tabs(["📊 生產排程表", "📈 效率分析", "⚠️ 閒置人力"])
+                
+                with tab1:
+                    st.dataframe(df_schedule, use_container_width=True)
+                
+                with tab2:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.subheader("每日效率")
+                        st.dataframe(df_efficiency)
+                    with col2:
+                        st.subheader("產線稼動率")
+                        st.dataframe(df_utilization)
+                        
+                with tab3:
+                    st.dataframe(df_idle, use_container_width=True)
+
+else:
+    st.info("👈 請從左側開始設定參數，再上傳檔案。")
