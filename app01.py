@@ -9,12 +9,12 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數 (Global Helpers)
 # ==========================================
-SYSTEM_VERSION = "v5.7.2 (Structure Refactored & Stable)"
+SYSTEM_VERSION = "v5.7.3 (Custom Rules: Lines 4-8 & Product constraints)"
 
 # 線外製程分類與資源限制設定
 OFFLINE_CONFIG = {
     # 1. 超音波熔接 (限制 1 站) -> 絕對單工
-    "超音波熔接": ("線外-超音波熔接", 1), 
+    "超音波": ("線外-超音波熔接", 1), 
     "熔接": ("線外-超音波熔接", 1),   
     
     # 2. LS 雷射 (限制 2 站)
@@ -66,7 +66,7 @@ def format_time_str(minute_idx):
     mm = m_of_day % 60
     return f"D{d} {hh:02d}:{mm:02d}"
 
-# ★★★ 將輔助函數移至全域，避免縮排錯誤 ★★★
+# 線外分類函數
 def categorize_offline(val):
     val_str = str(val)
     for kw, (name, limit) in OFFLINE_CONFIG.items():
@@ -74,6 +74,7 @@ def categorize_offline(val):
             return name, limit
     return "Online", -1
 
+# 指定線提取函數 (回傳數字 4, 5, 6, 7, 8)
 def extract_line_num(val):
     val_str = str(val).upper().replace(' ', '')
     match = re.search(r'LINE(\d+)', val_str)
@@ -168,17 +169,18 @@ def calculate_line_utilization(line_usage_matrix, line_masks, total_lines, days_
             busy_mask = line_usage_matrix[i][day_start:day_end]
             valid_busy_mask = busy_mask & available_mask
             busy_mins = np.sum(valid_busy_mask)
+            # ★ UI 修正：index i=0 對應 Line 4
             if available_mins > 0:
                 util_rate = (busy_mins / available_mins) * 100
-                row[f'Line {i+1} (%)'] = round(util_rate, 1)
+                row[f'Line {i+4} (%)'] = round(util_rate, 1)
             else:
-                row[f'Line {i+1} (%)'] = "-"
+                row[f'Line {i+4} (%)'] = "-"
         if any(v != "-" for k, v in row.items() if k != '日期'):
             utilization_records.append(row)
     return pd.DataFrame(utilization_records)
 
 # ==========================================
-# 2. 資料讀取區 (結構簡化)
+# 2. 資料讀取區
 # ==========================================
 def load_and_clean_data(uploaded_file):
     try:
@@ -218,25 +220,21 @@ def load_and_clean_data(uploaded_file):
         df = df[(df['Qty'] > 0) & (df['Manpower_Req'] > 0)]
         df['Base_Model'] = df['Product_ID'].apply(get_base_model)
         
-        # 使用全域函數進行分類
         temp_res = df['Process_Type'].apply(categorize_offline)
         df['Process_Category'] = temp_res.apply(lambda x: x[0])
         df['Concurrency_Limit'] = temp_res.apply(lambda x: x[1])
         df['Is_Offline'] = df['Process_Category'] != "Online"
 
-        # 強制初始化欄位
         if 'Rush_Col' not in df.columns: df['Rush_Col'] = ''
         if 'Line_Col' not in df.columns: df['Line_Col'] = ''
 
-        # 急單優先權
         df['Is_Rush'] = df['Rush_Col'].astype(str).str.contains('急單', na=False) | df['Remarks'].astype(str).str.contains('急單', na=False)
 
-        # 指定線判斷 (使用全域函數)
+        # 指定線判斷
         df['Target_Line'] = df['Line_Col'].apply(extract_line_num)
         mask_no_line = df['Target_Line'] == 0
         df.loc[mask_no_line, 'Target_Line'] = df.loc[mask_no_line, 'Remarks'].apply(extract_line_num)
 
-        # 工序順序 (使用全域函數)
         df['Sequence'] = df['Remarks'].apply(get_sequence)
         
         return df, None
@@ -264,7 +262,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     results = []
     line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
     
-    # 線外資源佔用表
     offline_resource_usage = {}
     order_finish_times = {}
 
@@ -280,11 +277,33 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         
         target_lines = group_df['Target_Line'].unique()
         specific_requests = [t for t in target_lines if t > 0]
+        
+        # 決定候選產線 (0-based index)
+        # 邏輯：LINE4=0, LINE5=1, LINE6=2, LINE7=3, LINE8=4
         if specific_requests:
-            valid_reqs = [t-1 for t in specific_requests if t <= total_lines]
+            # 使用者輸入 4 對應 index 0, 輸入 7 對應 index 3
+            valid_reqs = [t-4 for t in specific_requests if 4 <= t <= (3 + total_lines)]
             candidate_lines = valid_reqs if valid_reqs else [i for i in range(total_lines)]
         else:
+            # 無指定線時的邏輯
             candidate_lines = [i for i in range(total_lines)]
+
+            # ★★★ 規則 2: N-DE* 開頭，只能排在 LINE7 (Index 3) ★★★
+            if str(base_model).startswith("N-DE"):
+                # 確保產線數量足夠 (至少有4條線才能排到 index 3)
+                if total_lines >= 4:
+                    candidate_lines = [3] 
+
+        # ★★★ 規則 3: LINE4 (Index 0) 只能排 N-3610* ★★★
+        is_n3610 = str(base_model).startswith("N-3610")
+        if not is_n3610:
+            # 如果不是 N-3610，則不能排入 Index 0 (LINE4)
+            if 0 in candidate_lines:
+                candidate_lines.remove(0)
+
+        # 防呆：如果篩選後沒產線可排，退回所有產線 (不含 LINE4)
+        if not candidate_lines:
+            candidate_lines = [i for i in range(1, total_lines)] # 避開 index 0
 
         sorted_df = group_df.sort_values(by=['Is_Rush', 'Priority'], ascending=[False, True])
 
@@ -396,7 +415,8 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     order_finish_times[(str(row['Order_ID']), row['Sequence'])] = real_end
 
                     results.append({
-                        '產線': f"Line {target_line_idx+1}", 
+                        # ★ UI 修正: index 0 -> Line 4
+                        '產線': f"Line {target_line_idx+4}", 
                         '工單': row['Order_ID'], '產品': row['Product_ID'], 
                         '數量': row['Qty'], '類別': '流水線', '換線(分)': this_setup,
                         '需求人力': manpower, '預計開始': format_time_str(real_start),
@@ -406,7 +426,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                         '急單': 'Yes' if row.get('Is_Rush') else ''
                     })
                 else:
-                    results.append({'工單': row['Order_ID'], '狀態': '失敗(資源不足)', '產線': f"Line {target_line_idx+1}"})
+                    results.append({'工單': row['Order_ID'], '狀態': '失敗(資源不足)', '產線': f"Line {target_line_idx+4}"})
 
     # --- Phase 2: 線外工單 (Offline) ---
     df_offline = df[df['Is_Offline'] == True].copy()
@@ -437,7 +457,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
              results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': offline_category})
              continue
         
-        # Dependency Check
         seq = row['Sequence']
         order_id = str(row['Order_ID'])
         min_start_time = 480 
@@ -539,12 +558,13 @@ with st.sidebar:
     line_settings_from_ui = []
     with st.expander("點此展開設定詳細時間", expanded=True):
         for i in range(total_lines):
-            st.markdown(f"**Line {i+1}**")
+            # ★ UI 修正: 顯示 Line 4 ~ Line 8
+            st.markdown(f"**Line {i+4}**")
             col1, col2 = st.columns(2)
             with col1:
-                t_start = st.time_input(f"L{i+1} 開始", value=time(8, 0), key=f"start_{i}")
+                t_start = st.time_input(f"L{i+4} 開始", value=time(8, 0), key=f"start_{i}")
             with col2:
-                t_end = st.time_input(f"L{i+1} 結束", value=time(17, 0), key=f"end_{i}")
+                t_end = st.time_input(f"L{i+4} 結束", value=time(17, 0), key=f"end_{i}")
             
             line_settings_from_ui.append({
                 "start": t_start.strftime("%H:%M"), 
@@ -552,7 +572,7 @@ with st.sidebar:
             })
 
     st.markdown("---")
-    st.info("💡 邏輯說明：\n1. 線外製程分為：組裝前LS、超音波熔接、線邊組裝、PT。\n2. 備註欄數字 (1, 2) 代表工序，系統會確保順序生產。\n3. 優先讀取[急單]與[指定線]獨立欄位，若無則讀取[備註]。")
+    st.info("💡 邏輯說明：\n1. 流水線為 Line4 ~ Line8。\n2. N-DE* 產品優先排入 Line 7。\n3. Line 4 僅限 N-3610* 產品使用。")
 
 uploaded_file = st.file_uploader("📂 請上傳工單 Excel 檔案", type=["xlsx", "xls"])
 
