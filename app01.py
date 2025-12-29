@@ -7,7 +7,7 @@ import math
 import re
 
 # ==========================================
-# 1. 核心邏輯與輔助函數區
+# 1. 全域配置與輔助函數 (Global Helpers)
 # ==========================================
 SYSTEM_VERSION = "v5.7.2 (Structure Refactored & Stable)"
 
@@ -66,7 +66,7 @@ def format_time_str(minute_idx):
     mm = m_of_day % 60
     return f"D{d} {hh:02d}:{mm:02d}"
 
-# 線外分類函數 (移至全域)
+# ★★★ 將輔助函數移至全域，避免縮排錯誤 ★★★
 def categorize_offline(val):
     val_str = str(val)
     for kw, (name, limit) in OFFLINE_CONFIG.items():
@@ -74,7 +74,6 @@ def categorize_offline(val):
             return name, limit
     return "Online", -1
 
-# 指定線提取函數 (移至全域)
 def extract_line_num(val):
     val_str = str(val).upper().replace(' ', '')
     match = re.search(r'LINE(\d+)', val_str)
@@ -83,7 +82,6 @@ def extract_line_num(val):
         except: return 0
     return 0
 
-# 順序提取函數 (移至全域)
 def get_sequence(val):
     try:
         match = re.search(r'\d+', str(val))
@@ -179,6 +177,9 @@ def calculate_line_utilization(line_usage_matrix, line_masks, total_lines, days_
             utilization_records.append(row)
     return pd.DataFrame(utilization_records)
 
+# ==========================================
+# 2. 資料讀取區 (結構簡化)
+# ==========================================
 def load_and_clean_data(uploaded_file):
     try:
         df = pd.read_excel(uploaded_file)
@@ -217,7 +218,7 @@ def load_and_clean_data(uploaded_file):
         df = df[(df['Qty'] > 0) & (df['Manpower_Req'] > 0)]
         df['Base_Model'] = df['Product_ID'].apply(get_base_model)
         
-        # 線外分類與資源標記 (使用全域函數)
+        # 使用全域函數進行分類
         temp_res = df['Process_Type'].apply(categorize_offline)
         df['Process_Category'] = temp_res.apply(lambda x: x[0])
         df['Concurrency_Limit'] = temp_res.apply(lambda x: x[1])
@@ -242,7 +243,9 @@ def load_and_clean_data(uploaded_file):
     except Exception as e:
         return None, str(e)
 
-# 排程核心
+# ==========================================
+# 3. 排程運算區
+# ==========================================
 def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings):
     MAX_MINUTES = 14 * 24 * 60 
     
@@ -420,7 +423,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         offline_category = row['Process_Category']
         concurrency_limit = row['Concurrency_Limit']
         
-        # 決定要使用的資源站點
         candidate_stations = []
         if concurrency_limit == 0:
             pass 
@@ -444,8 +446,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             if (order_id, prev_seq) in order_finish_times:
                 min_start_time = order_finish_times[(order_id, prev_seq)]
         
-        # 尋找最佳站點與時間
-        best_choice = None # (start_time, end_time, station_id)
+        best_choice = None
         stations_to_try = candidate_stations if candidate_stations else [None]
         
         for station_id in stations_to_try:
@@ -518,7 +519,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     return pd.DataFrame(results), df_idle, df_efficiency, df_utilization
 
 # ==========================================
-# 2. Streamlit 網頁介面設計
+# 4. Streamlit 網頁介面設計
 # ==========================================
 
 st.set_page_config(page_title="AI 智能排程系統", layout="wide")
