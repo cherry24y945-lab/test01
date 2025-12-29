@@ -16,10 +16,8 @@ SYSTEM_VERSION = "v5.6 (Multi-Column Logic & Categorized Offline)"
 OFFLINE_MAPPING = {
     "超音波熔接": "線外-超音波熔接",
     "LS": "線外-組裝前LS",
-    "雷射": "線外-組裝前LS",
     "PT": "線外-PT",
-    "PKM": "線外-線邊組裝",
-    "AS": "線外-線邊組裝",
+    "裝配前組裝(PKM)": "線外-線邊組裝"
 }
 
 def get_base_model(product_id):
