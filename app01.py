@@ -14,14 +14,12 @@ SYSTEM_VERSION = "v5.6 (Multi-Column Logic & Categorized Offline)"
 # ★★★ 修改 1: 線外製程分類對照表 (關鍵字 -> 顯示名稱) ★★★
 # 系統會依序檢查製程名稱是否包含 Key，若有則歸類為 Value
 OFFLINE_MAPPING = {
-    "超音波": "線外-超音波熔接",
-    "熔接": "線外-超音波熔接",
+    "超音波熔接": "線外-超音波熔接",
     "LS": "線外-組裝前LS",
     "雷射": "線外-組裝前LS",
     "PT": "線外-PT",
     "PKM": "線外-線邊組裝",
-    "線邊": "線外-線邊組裝",
-    "組裝前": "線外-線邊組裝" # 補強判斷
+    "AS": "線外-線邊組裝",
 }
 
 def get_base_model(product_id):
