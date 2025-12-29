@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 核心邏輯區
 # ==========================================
-SYSTEM_VERSION = "v5.6.3 (BugFix: Syntax Error & Rush Priority)"
+SYSTEM_VERSION = "v5.6.4 (BugFix: Syntax Error Fixed)"
 
 # 線外製程分類對照表
 OFFLINE_MAPPING = {
@@ -158,12 +158,13 @@ def load_and_clean_data(uploaded_file):
             elif '項次' in col: col_map['Priority'] = col
             elif '已領料' in col: col_map['Process_Type'] = col
             elif '備註' in col: col_map['Remarks'] = col
+            # 支援獨立欄位
             elif '急單' in col: col_map['Rush_Col'] = col
             elif '指定線' in col: col_map['Line_Col'] = col
             
         df = df.rename(columns={v: k for k, v in col_map.items()})
         
-        # ★★★ BugFix: 修正字串結尾的引號問題 ★★★
+        # ★★★ BugFix: 這裡修正了未閉合的字串 ★★★
         if 'Total_Man_Minutes' not in df.columns: return None, "錯誤：缺少「工時(分)」欄位"
         
         if 'Process_Type' not in df.columns: df['Process_Type'] = '組裝'
@@ -180,6 +181,7 @@ def load_and_clean_data(uploaded_file):
         df = df[(df['Qty'] > 0) & (df['Manpower_Req'] > 0)]
         df['Base_Model'] = df['Product_ID'].apply(get_base_model)
         
+        # --- 判斷是否為線外 ---
         def check_offline_type(val):
             val_str = str(val)
             for kw, category_name in OFFLINE_MAPPING.items():
@@ -248,8 +250,9 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     
     batches = []
     for base_model, group_df in family_groups:
-        # 強化急單權重
+        # ★★★ 修改: 強化急單權重 ★★★
         is_rush = group_df['Is_Rush'].any() 
+        # 計算總權重：急單權重極大化 (1000000)，確保絕對優先
         rush_weight = 1000000 if is_rush else 0
         total_work_load = (group_df['Manpower_Req'] * group_df['Total_Man_Minutes']).sum()
         
@@ -261,7 +264,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         else:
             candidate_lines = [i for i in range(total_lines)]
 
-        # 批次內排序
+        # 批次內的排序也遵照急單優先
         sorted_df = group_df.sort_values(by=['Is_Rush', 'Priority'], ascending=[False, True])
 
         batches.append({
@@ -272,7 +275,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             'candidate_lines': candidate_lines
         })
     
-    # 批次排序：急單優先
+    # ★★★ 排序邏輯：急單優先 (True > False)，其次是工作量 (大 > 小) ★★★
     batches.sort(key=lambda x: (x['is_rush'], x['weight']), reverse=True)
     
     for batch_idx, batch in enumerate(batches):
