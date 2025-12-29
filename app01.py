@@ -14,7 +14,7 @@ SYSTEM_VERSION = "v5.7.2 (Structure Refactored & Stable)"
 # 線外製程分類與資源限制設定
 OFFLINE_CONFIG = {
     # 1. 超音波熔接 (限制 1 站) -> 絕對單工
-    "超音波": ("線外-超音波熔接", 1), 
+    "超音波熔接": ("線外-超音波熔接", 1), 
     "熔接": ("線外-超音波熔接", 1),   
     
     # 2. LS 雷射 (限制 2 站)
@@ -420,6 +420,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         offline_category = row['Process_Category']
         concurrency_limit = row['Concurrency_Limit']
         
+        # 決定要使用的資源站點
         candidate_stations = []
         if concurrency_limit == 0:
             pass 
@@ -443,7 +444,8 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             if (order_id, prev_seq) in order_finish_times:
                 min_start_time = order_finish_times[(order_id, prev_seq)]
         
-        best_choice = None
+        # 尋找最佳站點與時間
+        best_choice = None # (start_time, end_time, station_id)
         stations_to_try = candidate_stations if candidate_stations else [None]
         
         for station_id in stations_to_try:
