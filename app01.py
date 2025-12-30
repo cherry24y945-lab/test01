@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數 (Global Helpers)
 # ==========================================
-SYSTEM_VERSION = "v5.8.1 (Feature: Offline Time Setting)"
+SYSTEM_VERSION = "v5.8.2 (Final: Unified Scheduling Loop)"
 
 # 線外製程分類與資源限制設定
 OFFLINE_CONFIG = {
@@ -25,7 +25,7 @@ OFFLINE_CONFIG = {
     
     # 4. 線邊組裝 (限制 2 站)
     "PKM": ("線外-線邊組裝", 2),
-    "裝配前組裝": ("線外-線邊組裝", 2),
+    "裝配": ("線外-線邊組裝", 2),
     "組裝": ("線外-線邊組裝", 2),
     "AS": ("線外-線邊組裝", 2)
 }
@@ -73,7 +73,7 @@ def categorize_offline(val):
             return name, limit
     return "Online", -1
 
-# 指定線提取函數
+# 指定線提取函數 (回傳數字 4, 5, 6, 7, 8)
 def extract_line_num(val):
     val_str = str(val).upper().replace(' ', '')
     match = re.search(r'LINE(\d+)', val_str)
@@ -242,11 +242,12 @@ def load_and_clean_data(uploaded_file):
         return None, str(e)
 
 # ==========================================
-# 3. 排程運算區
+# 3. 排程運算區 (Unified)
 # ==========================================
 def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings, offline_settings):
     MAX_MINUTES = 14 * 24 * 60 
     
+    # 1. 準備時間 Mask (Online)
     line_masks = []
     line_cumsums = []
     for setting in line_settings:
@@ -254,291 +255,253 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         line_masks.append(m)
         line_cumsums.append(np.cumsum(m))
         
-    # ★★★ 新增：線外專用時間 Mask ★★★
+    # 2. 準備時間 Mask (Offline)
     offline_mask = create_line_mask(offline_settings["start"], offline_settings["end"], 14)
     offline_cumsum = np.cumsum(offline_mask)
 
+    # 3. 初始化資源狀態
     timeline_manpower = np.zeros(MAX_MINUTES, dtype=int)
     line_usage_matrix = np.zeros((total_lines, MAX_MINUTES), dtype=bool)
-    results = []
+    
+    # 用來記錄各產線 "上一個生產的產品"，用於判斷換線
+    # key: line_index (0~N), value: base_model_string
+    line_last_model = {i: None for i in range(total_lines)}
+    
+    # 用來記錄各產線 "最早可用時間"
+    # key: line_index, value: minute_idx
     line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
     
+    # 線外資源佔用表
     offline_resource_usage = {}
-    order_finish_times = {}
-
-    # --- Phase 1: 流水線 (Online) ---
-    df_online = df[df['Is_Offline'] == False].copy()
-    family_groups = df_online.groupby('Base_Model')
+    order_finish_times = {} # (Order_ID, Sequence) -> Finish_Time
     
-    batches = []
-    for base_model, group_df in family_groups:
-        is_rush = group_df['Is_Rush'].any() 
-        rush_weight = 1000000 if is_rush else 0
-        total_work_load = (group_df['Manpower_Req'] * group_df['Total_Man_Minutes']).sum()
-        
-        target_lines = group_df['Target_Line'].unique()
-        specific_requests = [t for t in target_lines if t > 0]
-        
-        if specific_requests:
-            valid_reqs = [t-4 for t in specific_requests if 4 <= t <= (3 + total_lines)]
-            candidate_lines = valid_reqs if valid_reqs else [i for i in range(total_lines)]
-        else:
-            candidate_lines = [i for i in range(total_lines)]
+    results = []
 
-            if str(base_model).startswith("N-DE"):
-                if total_lines >= 4:
-                    candidate_lines = [3] 
-
-        is_n3610 = str(base_model).startswith("N-3610")
-        if not is_n3610:
-            if 0 in candidate_lines:
-                candidate_lines.remove(0)
-
-        if not candidate_lines:
-            candidate_lines = [i for i in range(1, total_lines)] 
-
-        # ★★★ 整單急單權重計算 ★★★
-        rush_orders = group_df[group_df['Is_Rush']]['Order_ID'].unique()
-        group_df['Order_Is_Rush'] = group_df['Order_ID'].isin(rush_orders)
-        is_batch_rush = group_df['Order_Is_Rush'].any()
-
-        # ★★★ 排序加入 Sequence ★★★
-        sorted_df = group_df.sort_values(
-            by=['Order_Is_Rush', 'Order_ID', 'Sequence', 'Priority'], 
-            ascending=[False, True, True, True]
-        )
-
-        batches.append({
-            'base_model': base_model,
-            'df': sorted_df,
-            'is_rush': is_batch_rush,
-            'weight': rush_weight + total_work_load, 
-            'candidate_lines': candidate_lines
-        })
+    # ★★★ 統一排序邏輯：整單急單 > 產品 > 工單 > 順序 ★★★
+    # 1. 計算整單急單
+    rush_orders = df[df['Is_Rush']]['Order_ID'].unique()
+    df['Order_Is_Rush'] = df['Order_ID'].isin(rush_orders)
     
-    batches.sort(key=lambda x: (x['is_rush'], x['weight']), reverse=True)
-    
-    for batch_idx, batch in enumerate(batches):
-        candidate_lines = batch['candidate_lines']
-        batch_df = batch['df']
-        best_line_choice = None 
-        
-        for line_idx in candidate_lines:
-            curr_mask = line_masks[line_idx]
-            curr_cumsum = line_cumsums[line_idx]
-            t_search = line_free_time[line_idx]
-            
-            first_row = batch_df.iloc[0]
-            first_manpower = int(first_row['Manpower_Req'])
-            first_duration = int(np.ceil(first_row['Total_Man_Minutes'] / first_manpower))
-            setup_time = changeover_mins if t_search > 480 else 0
-            
-            total_need = setup_time + first_duration
-            found = False
-            start_t = -1
-            
-            temp_search = t_search
-            while not found and temp_search < MAX_MINUTES - total_need:
-                if not curr_mask[temp_search]:
-                    temp_search += 1
-                    continue
-                
-                s_val = curr_cumsum[temp_search]
-                t_val = s_val + total_need
-                if t_val > curr_cumsum[-1]: break
-                t_end = np.searchsorted(curr_cumsum, t_val)
-                
-                i_mask = curr_mask[temp_search:t_end]
-                max_u = np.max(timeline_manpower[temp_search:t_end][i_mask]) if np.any(i_mask) else 0
-                
-                if max_u + first_manpower <= total_manpower:
-                    start_t = temp_search
-                    found = True
-                else:
-                    temp_search += 5
-            
-            if found:
-                score = start_t
-                if best_line_choice is None or score < best_line_choice[0]:
-                    best_line_choice = (score, line_idx, start_t, setup_time)
-                    
-        if best_line_choice:
-            _, target_line_idx, batch_start_time, initial_setup = best_line_choice
-            current_t = batch_start_time
-            
-            for i, (idx, row) in enumerate(batch_df.iterrows()):
-                manpower = int(row['Manpower_Req'])
-                total_man_minutes = float(row['Total_Man_Minutes'])
-                prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
-                this_setup = initial_setup if i == 0 else 0
-                
-                curr_mask = line_masks[target_line_idx]
-                curr_cumsum = line_cumsums[target_line_idx]
-                total_work = this_setup + prod_duration
-                found_slot = False
-                
-                seq = row['Sequence']
-                order_id = str(row['Order_ID'])
-                min_start_from_dep = 0
-                if seq > 1:
-                    prev_seq = seq - 1
-                    if (order_id, prev_seq) in order_finish_times:
-                        min_start_from_dep = order_finish_times[(order_id, prev_seq)]
-
-                t_scan = max(current_t, line_free_time[target_line_idx], min_start_from_dep)
-                real_start, real_end = -1, -1
-                
-                while not found_slot and t_scan < MAX_MINUTES - total_work:
-                    if not curr_mask[t_scan]:
-                        t_scan += 1
-                        continue
-                    
-                    s_val = curr_cumsum[t_scan]
-                    t_val = s_val + total_work
-                    if t_val > curr_cumsum[-1]: break
-                    t_end = np.searchsorted(curr_cumsum, t_val)
-                    
-                    i_mask = curr_mask[t_scan:t_end]
-                    max_u = np.max(timeline_manpower[t_scan:t_end][i_mask]) if np.any(i_mask) else 0
-                    
-                    if max_u + manpower <= total_manpower:
-                        real_start, real_end, found_slot = t_scan, t_end, True
-                    else:
-                        t_scan += 5
-                
-                if found_slot:
-                    mask_slice = curr_mask[real_start:real_end]
-                    timeline_manpower[real_start:real_end][mask_slice] += manpower
-                    line_usage_matrix[target_line_idx, real_start:real_end] = True
-                    current_t = real_end
-                    line_free_time[target_line_idx] = real_end 
-                    
-                    order_finish_times[(str(row['Order_ID']), row['Sequence'])] = real_end
-
-                    results.append({
-                        '產線': f"Line {target_line_idx+4}", 
-                        '工單': row['Order_ID'], '產品': row['Product_ID'], 
-                        '數量': row['Qty'], '類別': '流水線', '換線(分)': this_setup,
-                        '需求人力': manpower, '預計開始': format_time_str(real_start),
-                        '完工時間': format_time_str(real_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': real_end,
-                        '備註': row.get('Remarks', ''), 
-                        '指定線': row.get('Line_Col', ''), 
-                        '急單': 'Yes' if row.get('Order_Is_Rush') else ''
-                    })
-                else:
-                    results.append({'工單': row['Order_ID'], '狀態': '失敗(資源不足)', '產線': f"Line {target_line_idx+4}"})
-
-    # --- Phase 2: 線外工單 (Offline) ---
-    df_offline = df[df['Is_Offline'] == True].copy()
-    
-    # ★★★ 線外也套用整單急單邏輯 ★★★
-    rush_orders_offline = df_offline[df_offline['Is_Rush']]['Order_ID'].unique()
-    df_offline['Order_Is_Rush'] = df_offline['Order_ID'].isin(rush_orders_offline)
-    
-    df_offline = df_offline.sort_values(
-        by=['Order_Is_Rush', 'Order_ID', 'Sequence', 'Priority'], 
-        ascending=[False, True, True, True]
+    # 2. 排序 (將 Base_Model 加入排序以優化換線，但必須在 Sequence 之後? 
+    # 不，Sequence 必須在 Order_ID 之後。
+    # 最佳排序：急單 -> Base_Model (群組化) -> Order_ID -> Sequence)
+    # 這樣同類產品會在一起，同工單會在一起，同工單內順序會正確。
+    df_sorted = df.sort_values(
+        by=['Order_Is_Rush', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
+        ascending=[False, True, True, True, True]
     )
-    
-    # ★★★ 改用 offline_mask (來自設定) ★★★
-    curr_mask = offline_mask
-    curr_cumsum = offline_cumsum
 
-    for _, row in df_offline.iterrows():
+    # ★★★ 統一迴圈處理所有工單 ★★★
+    for idx, row in df_sorted.iterrows():
         manpower = int(row['Manpower_Req'])
         total_man_minutes = float(row['Total_Man_Minutes'])
         prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
         
-        offline_category = row['Process_Category']
-        concurrency_limit = row['Concurrency_Limit']
-        
-        candidate_stations = []
-        if concurrency_limit == 0:
-            pass 
-        else:
-            for i in range(1, concurrency_limit + 1):
-                res_id = f"{offline_category}-{i}"
-                if res_id not in offline_resource_usage:
-                    offline_resource_usage[res_id] = np.zeros(MAX_MINUTES, dtype=bool)
-                candidate_stations.append(res_id)
-
-        if manpower > total_manpower:
-             results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': offline_category})
-             continue
-        
+        is_offline = row['Is_Offline']
         seq = row['Sequence']
         order_id = str(row['Order_ID'])
-        
-        # 這裡也要用設定的開始時間 (parse_time_to_mins)
-        start_setting_mins = parse_time_to_mins(offline_settings["start"])
-        min_start_time = start_setting_mins 
+        base_model = row['Base_Model']
+
+        # --- 1. 計算最早可開始時間 (Dependency Check) ---
+        # 這裡也要用設定的開始時間
+        if is_offline:
+            start_limit = parse_time_to_mins(offline_settings["start"])
+        else:
+            # 線上預設用 Line 4 的開始時間當基準
+            start_limit = parse_time_to_mins(line_settings[0]["start"])
+            
+        min_start_time = start_limit
 
         if seq > 1:
             prev_seq = seq - 1
             if (order_id, prev_seq) in order_finish_times:
                 min_start_time = max(min_start_time, order_finish_times[(order_id, prev_seq)])
-        
-        best_choice = None
-        stations_to_try = candidate_stations if candidate_stations else [None]
-        
-        for station_id in stations_to_try:
-            res_usage_mask = offline_resource_usage[station_id] if station_id else None
-            
-            found = False
-            t_search = min_start_time
-            
-            while not found and t_search < MAX_MINUTES - prod_duration:
-                if not curr_mask[t_search]:
-                    t_search += 1
-                    continue
-                
-                s_val = curr_cumsum[t_search]
-                t_val = s_val + prod_duration
-                if t_val > curr_cumsum[-1]: break
-                t_end = np.searchsorted(curr_cumsum, t_val)
-                
-                i_mask = curr_mask[t_search:t_end]
-                current_max_used = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
-                
-                resource_conflict = False
-                if res_usage_mask is not None:
-                    if np.any(res_usage_mask[t_search:t_end]):
-                        resource_conflict = True
-                
-                if (current_max_used + manpower <= total_manpower) and (not resource_conflict):
-                    if best_choice is None or t_search < best_choice[0]:
-                        best_choice = (t_search, t_end, station_id)
-                    found = True 
-                else:
-                    t_search += 5 
-        
-        if best_choice:
-            final_start, final_end, final_station = best_choice
-            
-            mask_slice = curr_mask[final_start:final_end]
-            timeline_manpower[final_start:final_end][mask_slice] += manpower
-            
-            if final_station:
-                offline_resource_usage[final_station][final_start:final_end] = True
-                display_line_name = final_station 
             else:
-                display_line_name = offline_category 
+                # 若上一道工序還沒做完 (理論上排序過不會發生，除非資料有誤)，就只能推遲
+                # 但因為我們已經 sort by Sequence，這裡應該是安全的。
+                pass
 
+        # --- 2. 尋找可用資源 (Online vs Offline) ---
+        best_choice = None # (start, end, target_resource_id)
+
+        if is_offline:
+            # === 線外排程邏輯 ===
+            offline_category = row['Process_Category']
+            concurrency_limit = row['Concurrency_Limit']
+            
+            candidate_stations = []
+            if concurrency_limit == 0:
+                pass # 無限制
+            else:
+                for i in range(1, concurrency_limit + 1):
+                    res_id = f"{offline_category}-{i}"
+                    if res_id not in offline_resource_usage:
+                        offline_resource_usage[res_id] = np.zeros(MAX_MINUTES, dtype=bool)
+                    candidate_stations.append(res_id)
+            
+            stations_to_try = candidate_stations if candidate_stations else [None]
+            
+            for station_id in stations_to_try:
+                res_usage_mask = offline_resource_usage[station_id] if station_id else None
+                
+                found = False
+                t_search = min_start_time
+                
+                while not found and t_search < MAX_MINUTES - prod_duration:
+                    if not offline_mask[t_search]:
+                        t_search += 1
+                        continue
+                    
+                    # 檢查 Mask 區間
+                    s_val = offline_cumsum[t_search]
+                    t_val = s_val + prod_duration
+                    if t_val > offline_cumsum[-1]: break
+                    t_end = np.searchsorted(offline_cumsum, t_val)
+                    
+                    # 檢查人力
+                    if np.any(offline_mask[t_search:t_end]): # 確保區間有效
+                        i_mask = offline_mask[t_search:t_end]
+                        current_max_used = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
+                        
+                        # 檢查資源
+                        resource_conflict = False
+                        if res_usage_mask is not None:
+                            if np.any(res_usage_mask[t_search:t_end]):
+                                resource_conflict = True
+                        
+                        if (current_max_used + manpower <= total_manpower) and (not resource_conflict):
+                            if best_choice is None or t_search < best_choice[0]:
+                                best_choice = (t_search, t_end, station_id)
+                            found = True
+                        else:
+                            t_search += 5
+                    else:
+                        t_search += 5
+
+        else:
+            # === 線上排程邏輯 ===
+            target_line_req = row['Target_Line'] # 0, 1, 2...
+            
+            # 篩選候選產線
+            candidate_lines = []
+            if target_line_req > 0:
+                # User 指定 Line 4 (val=4) -> index 0
+                t_idx = target_line_req - 4
+                if 0 <= t_idx < total_lines:
+                    candidate_lines = [t_idx]
+            else:
+                candidate_lines = [i for i in range(total_lines)]
+                
+                # 特殊規則 1: N-DE* 只能去 Line 7 (index 3)
+                if str(base_model).startswith("N-DE"):
+                    if total_lines >= 4:
+                        candidate_lines = [3]
+                
+            # 特殊規則 2: Line 4 (index 0) 只能做 N-3610*
+            is_n3610 = str(base_model).startswith("N-3610")
+            if not is_n3610:
+                if 0 in candidate_lines:
+                    candidate_lines.remove(0)
+            
+            if not candidate_lines:
+                candidate_lines = [i for i in range(1, total_lines)] if total_lines > 1 else []
+
+            # 遍歷候選產線
+            for line_idx in candidate_lines:
+                curr_mask = line_masks[line_idx]
+                curr_cumsum = line_cumsums[line_idx]
+                
+                # 計算換線時間
+                setup_time = 0
+                if line_last_model[line_idx] is not None and line_last_model[line_idx] != base_model:
+                    setup_time = changeover_mins
+                
+                # 起始搜尋時間：該線目前空閒時間 vs 前置工序完成時間
+                t_start_search = max(line_free_time[line_idx], min_start_time)
+                
+                total_need = setup_time + prod_duration
+                
+                found = False
+                t_search = t_start_search
+                
+                while not found and t_search < MAX_MINUTES - total_need:
+                    if not curr_mask[t_search]:
+                        t_search += 1
+                        continue
+                        
+                    s_val = curr_cumsum[t_search]
+                    t_val = s_val + total_need
+                    if t_val > curr_cumsum[-1]: break
+                    t_end = np.searchsorted(curr_cumsum, t_val)
+                    
+                    # 檢查人力
+                    if np.any(curr_mask[t_search:t_end]):
+                        i_mask = curr_mask[t_search:t_end]
+                        max_u = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
+                        
+                        if max_u + manpower <= total_manpower:
+                             # 找到空檔
+                             if best_choice is None or t_search < best_choice[0]:
+                                 # 真正工作的開始時間 (扣掉換線)
+                                 real_work_start = t_search # 這裡簡化，setup 包含在佔用時間內
+                                 # 若要精確：setup 期間不佔用人力？通常佔用。
+                                 # 這裡假設 setup 也佔用人力與產線
+                                 best_choice = (t_search, t_end, line_idx, setup_time)
+                             found = True
+                        else:
+                            t_search += 5
+                    else:
+                        t_search += 5
+
+        # --- 3. 執行排入 ---
+        if best_choice:
+            if is_offline:
+                final_start, final_end, final_station = best_choice
+                this_setup = 0
+                
+                mask_slice = offline_mask[final_start:final_end]
+                timeline_manpower[final_start:final_end][mask_slice] += manpower
+                
+                if final_station:
+                    offline_resource_usage[final_station][final_start:final_end] = True
+                    display_line = final_station
+                else:
+                    display_line = row['Process_Category']
+                    
+            else:
+                final_start, final_end, final_line_idx, this_setup = best_choice
+                
+                curr_mask = line_masks[final_line_idx]
+                mask_slice = curr_mask[final_start:final_end]
+                timeline_manpower[final_start:final_end][mask_slice] += manpower
+                line_usage_matrix[final_line_idx, final_start:final_end] = True
+                
+                # 更新該線狀態
+                line_free_time[final_line_idx] = final_end
+                line_last_model[final_line_idx] = base_model
+                display_line = f"Line {final_line_idx+4}"
+
+            # 記錄完工時間供後續工序查詢
             order_finish_times[(str(row['Order_ID']), row['Sequence'])] = final_end
-
+            
+            # 實際生產的開始時間 (若有換線，start 是含換線的，這裡顯示生產開始時間？通常顯示 setup start)
+            # 保持簡單，顯示區間開始
+            
             results.append({
-                '產線': display_line_name,
+                '產線': display_line,
                 '工單': row['Order_ID'], '產品': row['Product_ID'], 
-                '數量': row['Qty'], '類別': '線外', '換線(分)': 0,
+                '數量': row['Qty'], '類別': '線外' if is_offline else '流水線', 
+                '換線(分)': this_setup,
                 '需求人力': manpower, '預計開始': format_time_str(final_start),
-                '完工時間': format_time_str(final_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': final_end,
+                '完工時間': format_time_str(final_end), '線佔用(分)': (final_end - final_start), 
+                '狀態': 'OK', '排序用': final_end,
                 '備註': row.get('Remarks', ''),
                 '指定線': row.get('Line_Col', ''),
                 '急單': 'Yes' if row.get('Order_Is_Rush') else ''
             })
-        else:
-             results.append({'工單': row['Order_ID'], '狀態': '失敗(資源或人力不足)', '產線': offline_category})
 
+        else:
+            results.append({'工單': row['Order_ID'], '狀態': '失敗(無資源)', '備註': '找不到空檔'})
 
     if results:
         last_time = max([r['排序用'] for r in results if r.get('狀態')=='OK'], default=0)
@@ -621,7 +584,7 @@ if uploaded_file is not None:
                     total_lines, 
                     changeover_mins, 
                     line_settings_from_ui,
-                    offline_settings_from_ui  # 傳入線外設定
+                    offline_settings_from_ui
                 )
                 
                 st.success("✅ 排程運算完成！")
