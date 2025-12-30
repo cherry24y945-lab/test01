@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數
 # ==========================================
-SYSTEM_VERSION = "v6.0 (Rules: N-3610 on Line 6)"
+SYSTEM_VERSION = "v6.1 (Fix: N-3610 exclusive to Line 6)"
 
 # 線外製程分類與資源限制
 OFFLINE_CONFIG = {
@@ -265,7 +265,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             if str(row['Base_Model']).startswith("N-DE") and total_lines >= 4:
                 target_idx = 3 # Line 7
             elif str(row['Base_Model']).startswith("N-3610") and total_lines >= 3:
-                target_idx = 2 # Line 6 (Index 2) [NEW Logic]
+                target_idx = 2 # Line 6 (Index 2) [FIXED Logic]
             else:
                 target_idx = 0 # Default Line 4 (but not enforced)
                 
@@ -381,14 +381,14 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     if str(base_model).startswith("N-DE") and total_lines >= 4:
                          c_lines = [3]
                     
-                    # 規則 2: N-3610* 強制去 Line 6 (Index 2)
+                    # 規則 2: N-3610* 強制去 Line 6 (Index 2) [FIXED Logic]
                     elif str(base_model).startswith("N-3610"):
                          if total_lines >= 3:
                              c_lines = [2] # 鎖定 Line 6
                          else:
                              c_lines = [] # 無產線可用
 
-                # 規則 3: Line 6 專屬於 N-3610* (其他產品不能用)
+                # 規則 3: Line 6 專屬於 N-3610* (其他產品不能用) [FIXED Logic]
                 # 如果當前產品不是 N-3610*，則從候選名單中移除 Index 2 (Line 6)
                 if not str(base_model).startswith("N-3610") and 2 in c_lines:
                     c_lines.remove(2)
@@ -502,12 +502,12 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     c_lines = [x for x in range(total_lines)]
                     # N-DE Rule
                     if str(base_model).startswith("N-DE") and total_lines >= 4: c_lines = [3]
-                    # N-3610 Rule
+                    # N-3610 Rule [FIXED Logic]
                     elif str(base_model).startswith("N-3610"):
                         if total_lines >= 3: c_lines = [2] # Line 6 (Index 2)
                         else: c_lines = []
 
-                # Protect Line 6
+                # Protect Line 6 [FIXED Logic]
                 if not str(base_model).startswith("N-3610") and 2 in c_lines:
                     c_lines.remove(2)
 
