@@ -9,16 +9,24 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數 (Global Helpers)
 # ==========================================
-SYSTEM_VERSION = "v5.7.6 (Fix: Improved Sequence Parsing)"
+SYSTEM_VERSION = "v5.7.8 (Fix: Sequence Execution Order)"
 
 # 線外製程分類與資源限制設定
+# 邏輯：(顯示名稱, 最大並行工單數)
 OFFLINE_CONFIG = {
+    # 1. 超音波熔接 (限制 1 站) -> 絕對單工
     "超音波熔接": ("線外-超音波熔接", 1), 
+    
+    # 2. LS 雷射 (限制 2 站)
     "LS": ("線外-組裝前LS", 2),
     "雷射": ("線外-組裝前LS", 2),
+    
+    # 3. PT (限制 1 站) -> 絕對單工
     "PT": ("線外-PT", 1),
+    
+    # 4. 線邊組裝 (限制 2 站)
     "PKM": ("線外-線邊組裝", 2),
-    "裝配": ("線外-線邊組裝", 2),
+    "裝配前組裝": ("線外-線邊組裝", 2),
     "組裝": ("線外-線邊組裝", 2),
     "AS": ("線外-線邊組裝", 2)
 }
@@ -66,7 +74,7 @@ def categorize_offline(val):
             return name, limit
     return "Online", -1
 
-# 指定線提取函數
+# 指定線提取函數 (回傳數字 4, 5, 6, 7, 8)
 def extract_line_num(val):
     val_str = str(val).upper().replace(' ', '')
     match = re.search(r'LINE(\d+)', val_str)
@@ -75,13 +83,11 @@ def extract_line_num(val):
         except: return 0
     return 0
 
-# ★★★ 改進版：更精確地抓取備註欄的順序數字 ★★★
+# 順序提取函數
 def get_sequence(val):
     try:
-        # 尋找字串中的第一個整數 (支援多位數，例如 10, 11)
         match = re.search(r'(\d+)', str(val))
-        if match:
-            return int(match.group(1))
+        if match: return int(match.group(1))
         return 0 
     except: return 0
 
@@ -290,7 +296,8 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         if not candidate_lines:
             candidate_lines = [i for i in range(1, total_lines)] 
 
-        sorted_df = group_df.sort_values(by=['Is_Rush', 'Priority'], ascending=[False, True])
+        # ★★★ 關鍵修正：排序加入 Sequence，確保 1 -> 2 -> 3 順序執行 ★★★
+        sorted_df = group_df.sort_values(by=['Is_Rush', 'Order_ID', 'Sequence', 'Priority'], ascending=[False, True, True, True])
 
         batches.append({
             'base_model': base_model,
@@ -414,7 +421,8 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
 
     # --- Phase 2: 線外工單 (Offline) ---
     df_offline = df[df['Is_Offline'] == True].copy()
-    df_offline = df_offline.sort_values(by=['Is_Rush', 'Priority'], ascending=[False, True])
+    # ★★★ 關鍵修正：線外也要加入 Sequence 排序 ★★★
+    df_offline = df_offline.sort_values(by=['Is_Rush', 'Order_ID', 'Sequence', 'Priority'], ascending=[False, True, True, True])
     
     curr_mask = offline_mask
     curr_cumsum = offline_cumsum
