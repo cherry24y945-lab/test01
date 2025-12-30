@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數 (Global Helpers)
 # ==========================================
-SYSTEM_VERSION = "v5.8 (Fix: Order-Level Rush Logic)"
+SYSTEM_VERSION = "v5.8.1 (Feature: Offline Time Setting)"
 
 # 線外製程分類與資源限制設定
 OFFLINE_CONFIG = {
@@ -244,7 +244,7 @@ def load_and_clean_data(uploaded_file):
 # ==========================================
 # 3. 排程運算區
 # ==========================================
-def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings):
+def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings, offline_settings):
     MAX_MINUTES = 14 * 24 * 60 
     
     line_masks = []
@@ -254,8 +254,9 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         line_masks.append(m)
         line_cumsums.append(np.cumsum(m))
         
-    offline_mask = line_masks[0]
-    offline_cumsum = line_cumsums[0]
+    # ★★★ 新增：線外專用時間 Mask ★★★
+    offline_mask = create_line_mask(offline_settings["start"], offline_settings["end"], 14)
+    offline_cumsum = np.cumsum(offline_mask)
 
     timeline_manpower = np.zeros(MAX_MINUTES, dtype=int)
     line_usage_matrix = np.zeros((total_lines, MAX_MINUTES), dtype=bool)
@@ -271,14 +272,8 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     
     batches = []
     for base_model, group_df in family_groups:
-        # ★★★ 修正：整單急單邏輯 (Order-Level Rush) ★★★
-        # 只要該工單有任一工序是急單，整張單都視為急單
-        rush_orders = group_df[group_df['Is_Rush']]['Order_ID'].unique()
-        group_df['Order_Is_Rush'] = group_df['Order_ID'].isin(rush_orders)
-        
-        # 批次權重計算 (以整單急單狀態為準)
-        is_batch_rush = group_df['Order_Is_Rush'].any()
-        rush_weight = 1000000 if is_batch_rush else 0
+        is_rush = group_df['Is_Rush'].any() 
+        rush_weight = 1000000 if is_rush else 0
         total_work_load = (group_df['Manpower_Req'] * group_df['Total_Man_Minutes']).sum()
         
         target_lines = group_df['Target_Line'].unique()
@@ -302,7 +297,12 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         if not candidate_lines:
             candidate_lines = [i for i in range(1, total_lines)] 
 
-        # ★★★ 修正排序：先排急單，再排 Sequence (1->2->3) ★★★
+        # ★★★ 整單急單權重計算 ★★★
+        rush_orders = group_df[group_df['Is_Rush']]['Order_ID'].unique()
+        group_df['Order_Is_Rush'] = group_df['Order_ID'].isin(rush_orders)
+        is_batch_rush = group_df['Order_Is_Rush'].any()
+
+        # ★★★ 排序加入 Sequence ★★★
         sorted_df = group_df.sort_values(
             by=['Order_Is_Rush', 'Order_ID', 'Sequence', 'Priority'], 
             ascending=[False, True, True, True]
@@ -423,7 +423,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                         '完工時間': format_time_str(real_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': real_end,
                         '備註': row.get('Remarks', ''), 
                         '指定線': row.get('Line_Col', ''), 
-                        '急單': 'Yes' if row.get('Is_Rush') else ''
+                        '急單': 'Yes' if row.get('Order_Is_Rush') else ''
                     })
                 else:
                     results.append({'工單': row['Order_ID'], '狀態': '失敗(資源不足)', '產線': f"Line {target_line_idx+4}"})
@@ -431,7 +431,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     # --- Phase 2: 線外工單 (Offline) ---
     df_offline = df[df['Is_Offline'] == True].copy()
     
-    # ★★★ 修正：線外也套用整單急單邏輯 ★★★
+    # ★★★ 線外也套用整單急單邏輯 ★★★
     rush_orders_offline = df_offline[df_offline['Is_Rush']]['Order_ID'].unique()
     df_offline['Order_Is_Rush'] = df_offline['Order_ID'].isin(rush_orders_offline)
     
@@ -440,6 +440,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         ascending=[False, True, True, True]
     )
     
+    # ★★★ 改用 offline_mask (來自設定) ★★★
     curr_mask = offline_mask
     curr_cumsum = offline_cumsum
 
@@ -467,11 +468,15 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         
         seq = row['Sequence']
         order_id = str(row['Order_ID'])
-        min_start_time = 480 
+        
+        # 這裡也要用設定的開始時間 (parse_time_to_mins)
+        start_setting_mins = parse_time_to_mins(offline_settings["start"])
+        min_start_time = start_setting_mins 
+
         if seq > 1:
             prev_seq = seq - 1
             if (order_id, prev_seq) in order_finish_times:
-                min_start_time = order_finish_times[(order_id, prev_seq)]
+                min_start_time = max(min_start_time, order_finish_times[(order_id, prev_seq)])
         
         best_choice = None
         stations_to_try = candidate_stations if candidate_stations else [None]
@@ -480,7 +485,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             res_usage_mask = offline_resource_usage[station_id] if station_id else None
             
             found = False
-            t_search = max(480, min_start_time)
+            t_search = min_start_time
             
             while not found and t_search < MAX_MINUTES - prod_duration:
                 if not curr_mask[t_search]:
@@ -529,7 +534,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                 '完工時間': format_time_str(final_end), '線佔用(分)': prod_duration, '狀態': 'OK', '排序用': final_end,
                 '備註': row.get('Remarks', ''),
                 '指定線': row.get('Line_Col', ''),
-                '急單': 'Yes' if row.get('Is_Rush') else ''
+                '急單': 'Yes' if row.get('Order_Is_Rush') else ''
             })
         else:
              results.append({'工單': row['Order_ID'], '狀態': '失敗(資源或人力不足)', '產線': offline_category})
@@ -578,6 +583,20 @@ with st.sidebar:
                 "start": t_start.strftime("%H:%M"), 
                 "end": t_end.strftime("%H:%M")
             })
+    
+    # ★★★ 新增：線外專區設定 ★★★
+    st.markdown("---")
+    st.markdown("**線外專區 (Offline)**")
+    col1, col2 = st.columns(2)
+    with col1:
+        off_start = st.time_input("線外 開始", value=time(8, 0), key="off_start")
+    with col2:
+        off_end = st.time_input("線外 結束", value=time(17, 0), key="off_end")
+    
+    offline_settings_from_ui = {
+        "start": off_start.strftime("%H:%M"),
+        "end": off_end.strftime("%H:%M")
+    }
 
     st.markdown("---")
     st.info("💡 邏輯說明：\n1. 流水線為 Line4 ~ Line8。\n2. N-DE* 產品優先排入 Line 7。\n3. Line 4 僅限 N-3610* 產品使用。")
@@ -601,7 +620,8 @@ if uploaded_file is not None:
                     total_manpower, 
                     total_lines, 
                     changeover_mins, 
-                    line_settings_from_ui
+                    line_settings_from_ui,
+                    offline_settings_from_ui  # 傳入線外設定
                 )
                 
                 st.success("✅ 排程運算完成！")
