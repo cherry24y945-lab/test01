@@ -9,24 +9,16 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數 (Global Helpers)
 # ==========================================
-SYSTEM_VERSION = "v5.7.8 (Fix: Sequence Execution Order)"
+SYSTEM_VERSION = "v5.7.9 (Critical Fix: Absolute Sequence Order)"
 
 # 線外製程分類與資源限制設定
-# 邏輯：(顯示名稱, 最大並行工單數)
 OFFLINE_CONFIG = {
-    # 1. 超音波熔接 (限制 1 站) -> 絕對單工
     "超音波熔接": ("線外-超音波熔接", 1), 
-    
-    # 2. LS 雷射 (限制 2 站)
     "LS": ("線外-組裝前LS", 2),
     "雷射": ("線外-組裝前LS", 2),
-    
-    # 3. PT (限制 1 站) -> 絕對單工
     "PT": ("線外-PT", 1),
-    
-    # 4. 線邊組裝 (限制 2 站)
     "PKM": ("線外-線邊組裝", 2),
-    "裝配前組裝": ("線外-線邊組裝", 2),
+    "裝配": ("線外-線邊組裝", 2),
     "組裝": ("線外-線邊組裝", 2),
     "AS": ("線外-線邊組裝", 2)
 }
@@ -74,7 +66,7 @@ def categorize_offline(val):
             return name, limit
     return "Online", -1
 
-# 指定線提取函數 (回傳數字 4, 5, 6, 7, 8)
+# 指定線提取函數
 def extract_line_num(val):
     val_str = str(val).upper().replace(' ', '')
     match = re.search(r'LINE(\d+)', val_str)
@@ -296,7 +288,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         if not candidate_lines:
             candidate_lines = [i for i in range(1, total_lines)] 
 
-        # ★★★ 關鍵修正：排序加入 Sequence，確保 1 -> 2 -> 3 順序執行 ★★★
+        # ★★★ 關鍵修正：排序加入 Sequence 且位於 Priority 之前 ★★★
         sorted_df = group_df.sort_values(by=['Is_Rush', 'Order_ID', 'Sequence', 'Priority'], ascending=[False, True, True, True])
 
         batches.append({
@@ -421,7 +413,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
 
     # --- Phase 2: 線外工單 (Offline) ---
     df_offline = df[df['Is_Offline'] == True].copy()
-    # ★★★ 關鍵修正：線外也要加入 Sequence 排序 ★★★
+    # ★★★ 關鍵修正：線外排序邏輯加入 Sequence ★★★
     df_offline = df_offline.sort_values(by=['Is_Rush', 'Order_ID', 'Sequence', 'Priority'], ascending=[False, True, True, True])
     
     curr_mask = offline_mask
@@ -449,6 +441,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
              results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': offline_category})
              continue
         
+        # Dependency Check
         seq = row['Sequence']
         order_id = str(row['Order_ID'])
         min_start_time = 480 
@@ -550,6 +543,7 @@ with st.sidebar:
     line_settings_from_ui = []
     with st.expander("點此展開設定詳細時間", expanded=True):
         for i in range(total_lines):
+            # ★ UI 修正: 顯示 Line 4 ~ Line 8
             st.markdown(f"**Line {i+4}**")
             col1, col2 = st.columns(2)
             with col1:
