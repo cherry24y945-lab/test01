@@ -9,16 +9,23 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數 (Global Helpers)
 # ==========================================
-SYSTEM_VERSION = "v5.7.9 (Critical Fix: Absolute Sequence Order)"
+SYSTEM_VERSION = "v5.8 (Fix: Order-Level Rush Logic)"
 
 # 線外製程分類與資源限制設定
 OFFLINE_CONFIG = {
+    # 1. 超音波熔接 (限制 1 站) -> 絕對單工
     "超音波熔接": ("線外-超音波熔接", 1), 
+    
+    # 2. LS 雷射 (限制 2 站)
     "LS": ("線外-組裝前LS", 2),
     "雷射": ("線外-組裝前LS", 2),
+    
+    # 3. PT (限制 1 站) -> 絕對單工
     "PT": ("線外-PT", 1),
+    
+    # 4. 線邊組裝 (限制 2 站)
     "PKM": ("線外-線邊組裝", 2),
-    "裝配": ("線外-線邊組裝", 2),
+    "裝配前組裝": ("線外-線邊組裝", 2),
     "組裝": ("線外-線邊組裝", 2),
     "AS": ("線外-線邊組裝", 2)
 }
@@ -162,6 +169,7 @@ def calculate_line_utilization(line_usage_matrix, line_masks, total_lines, days_
             busy_mask = line_usage_matrix[i][day_start:day_end]
             valid_busy_mask = busy_mask & available_mask
             busy_mins = np.sum(valid_busy_mask)
+            # ★ UI 修正：index i=0 對應 Line 4
             if available_mins > 0:
                 util_rate = (busy_mins / available_mins) * 100
                 row[f'Line {i+4} (%)'] = round(util_rate, 1)
@@ -263,8 +271,14 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     
     batches = []
     for base_model, group_df in family_groups:
-        is_rush = group_df['Is_Rush'].any() 
-        rush_weight = 1000000 if is_rush else 0
+        # ★★★ 修正：整單急單邏輯 (Order-Level Rush) ★★★
+        # 只要該工單有任一工序是急單，整張單都視為急單
+        rush_orders = group_df[group_df['Is_Rush']]['Order_ID'].unique()
+        group_df['Order_Is_Rush'] = group_df['Order_ID'].isin(rush_orders)
+        
+        # 批次權重計算 (以整單急單狀態為準)
+        is_batch_rush = group_df['Order_Is_Rush'].any()
+        rush_weight = 1000000 if is_batch_rush else 0
         total_work_load = (group_df['Manpower_Req'] * group_df['Total_Man_Minutes']).sum()
         
         target_lines = group_df['Target_Line'].unique()
@@ -288,13 +302,16 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         if not candidate_lines:
             candidate_lines = [i for i in range(1, total_lines)] 
 
-        # ★★★ 關鍵修正：排序加入 Sequence 且位於 Priority 之前 ★★★
-        sorted_df = group_df.sort_values(by=['Is_Rush', 'Order_ID', 'Sequence', 'Priority'], ascending=[False, True, True, True])
+        # ★★★ 修正排序：先排急單，再排 Sequence (1->2->3) ★★★
+        sorted_df = group_df.sort_values(
+            by=['Order_Is_Rush', 'Order_ID', 'Sequence', 'Priority'], 
+            ascending=[False, True, True, True]
+        )
 
         batches.append({
             'base_model': base_model,
             'df': sorted_df,
-            'is_rush': is_rush,
+            'is_rush': is_batch_rush,
             'weight': rush_weight + total_work_load, 
             'candidate_lines': candidate_lines
         })
@@ -413,8 +430,15 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
 
     # --- Phase 2: 線外工單 (Offline) ---
     df_offline = df[df['Is_Offline'] == True].copy()
-    # ★★★ 關鍵修正：線外排序邏輯加入 Sequence ★★★
-    df_offline = df_offline.sort_values(by=['Is_Rush', 'Order_ID', 'Sequence', 'Priority'], ascending=[False, True, True, True])
+    
+    # ★★★ 修正：線外也套用整單急單邏輯 ★★★
+    rush_orders_offline = df_offline[df_offline['Is_Rush']]['Order_ID'].unique()
+    df_offline['Order_Is_Rush'] = df_offline['Order_ID'].isin(rush_orders_offline)
+    
+    df_offline = df_offline.sort_values(
+        by=['Order_Is_Rush', 'Order_ID', 'Sequence', 'Priority'], 
+        ascending=[False, True, True, True]
+    )
     
     curr_mask = offline_mask
     curr_cumsum = offline_cumsum
@@ -441,7 +465,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
              results.append({'工單': row['Order_ID'], '狀態': '失敗(人力不足)', '產線': offline_category})
              continue
         
-        # Dependency Check
         seq = row['Sequence']
         order_id = str(row['Order_ID'])
         min_start_time = 480 
