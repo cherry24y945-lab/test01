@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數
 # ==========================================
-SYSTEM_VERSION = "v6.5 (Final: Real-Time Idle Filling & Absolute Rush)"
+SYSTEM_VERSION = "v6.6 (Strict: Two-Phase Scheduling - Rush First)"
 
 # 線外製程分類與資源限制
 OFFLINE_CONFIG = {
@@ -232,7 +232,7 @@ def load_and_clean_data(uploaded_file):
         return None, str(e)
 
 # ==========================================
-# 3. 排程運算區 (Fixed: Rush Priority & Anti-Idle)
+# 3. 排程運算區 (Two-Phase: Rush First -> Normal)
 # ==========================================
 def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings, offline_settings):
     MAX_MINUTES = 14 * 24 * 60 
@@ -253,6 +253,8 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     
     offline_resource_usage = {}
     order_finish_times = {}
+    line_last_model = {i: None for i in range(total_lines)}
+    results = []
     
     # 預判 Target Line
     df_online_parts = df[df['Is_Offline'] == False]
@@ -272,324 +274,331 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         if row['Order_ID'] not in order_target_line_map:
             order_target_line_map[row['Order_ID']] = target_idx
 
-    # 全局排序
+    # 全局排序 & 拆分
     rush_orders_global = df[df['Is_Rush']]['Order_ID'].unique()
     df['Order_Is_Rush'] = df['Order_ID'].isin(rush_orders_global)
     
-    # 排序：急單 > 產品 > 順序
-    df_sorted = df.sort_values(
-        by=['Order_Is_Rush', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
-        ascending=[False, True, True, True, True]
+    # 這裡很關鍵：我們將急單和一般單分開成兩個清單
+    df_rush = df[df['Order_Is_Rush']].sort_values(
+        by=['Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
+        ascending=[True, True, True, True]
     )
     
-    line_last_model = {i: None for i in range(total_lines)}
+    df_normal = df[~df['Order_Is_Rush']].sort_values(
+        by=['Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
+        ascending=[True, True, True, True]
+    )
     
-    pending_tasks = df_sorted.to_dict('records')
-    results = []
+    # 建立兩個待辦清單
+    tasks_rush = df_rush.to_dict('records')
+    tasks_normal = df_normal.to_dict('records')
     
-    max_loops = len(pending_tasks) * 5 
-    loop_count = 0
-    
-    while pending_tasks and loop_count < max_loops:
-        loop_count += 1
-        best_task_candidate = None 
+    # =========================================================================
+    # 核心排程函數 (Reuse Logic)
+    # =========================================================================
+    def schedule_task_list(pending_tasks, is_rush_phase):
+        loop_count = 0
+        max_loops = len(pending_tasks) * 5
         
-        # 掃描 Pending List
-        for i, task in enumerate(pending_tasks):
-            manpower = int(task['Manpower_Req'])
-            total_man_minutes = float(task['Total_Man_Minutes'])
-            prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
+        while pending_tasks and loop_count < max_loops:
+            loop_count += 1
+            best_task_candidate = None 
             
-            is_offline = task['Is_Offline']
-            seq = task['Sequence']
-            order_id = str(task['Order_ID'])
-            base_model = task['Base_Model']
-            is_rush = task['Order_Is_Rush']
+            for i, task in enumerate(pending_tasks):
+                manpower = int(task['Manpower_Req'])
+                total_man_minutes = float(task['Total_Man_Minutes'])
+                prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
+                is_offline = task['Is_Offline']
+                seq = task['Sequence']
+                order_id = str(task['Order_ID'])
+                base_model = task['Base_Model']
 
-            # 1. Dependency Check
-            start_limit = 0
-            if is_offline:
-                start_limit = parse_time_to_mins(offline_settings["start"])
-                if order_id in order_target_line_map:
-                    t_idx = order_target_line_map[order_id]
-                    if 0 <= t_idx < len(line_free_time):
-                        jit_start = line_free_time[t_idx] - 2880 - prod_duration
-                        start_limit = max(start_limit, jit_start)
-            else:
-                start_limit = parse_time_to_mins(line_settings[0]["start"])
-
-            min_start_time = start_limit
-            dependency_blocked = False
-            
-            if seq > 1:
-                prev_seq = seq - 1
-                if (order_id, prev_seq) in order_finish_times:
-                    min_start_time = max(min_start_time, order_finish_times[(order_id, prev_seq)])
-                else:
-                    dependency_blocked = True
-            
-            if dependency_blocked:
-                continue
-
-            # 2. Trial Scheduling
-            possible_start = 9999999
-            target_line_choice = -1
-            setup_cost = 0
-            decision_reason = ""
-            
-            if is_offline:
-                 off_cat = task['Process_Category']
-                 limit = task['Concurrency_Limit']
-                 stations = []
-                 if limit == 0: pass 
-                 else:
-                     for k in range(1, limit + 1):
-                         stations.append(f"{off_cat}-{k}")
-                 
-                 stations = stations if stations else [None]
-                 found_slot = False
-                 t_check = min_start_time
-                 for offset in range(0, 1000, 30): 
-                     t_probe = t_check + offset
-                     if t_probe >= MAX_MINUTES: break
-                     if not offline_mask[t_probe]: continue
-                     
-                     if stations[0] and stations[0] in offline_resource_usage:
-                         if offline_resource_usage[stations[0]][t_probe]: continue
-                     
-                     possible_start = min(possible_start, t_probe)
-                     found_slot = True
-                     break
-                 if not found_slot: continue 
-                      
-            else:
-                # Online Booking
-                t_req = task['Target_Line']
-                c_lines = []
-                
-                if t_req > 0: 
-                    t_idx = t_req - 4
-                    if 0 <= t_idx < total_lines: c_lines = [t_idx]
-                else:
-                    c_lines = [x for x in range(total_lines)]
-                    if str(base_model).startswith("N-DE") and total_lines >= 4: c_lines = [3]
-                    elif str(base_model).startswith("N-3610"):
-                         if total_lines >= 3: c_lines = [2]
-                         else: c_lines = []
-
-                if not str(base_model).startswith("N-3610") and 2 in c_lines:
-                    c_lines.remove(2)
-                
-                if not c_lines: continue
-
-                for l_idx in c_lines:
-                    s_time = 0
-                    if line_last_model[l_idx] is not None and line_last_model[l_idx] != base_model:
-                        s_time = changeover_mins
-                    
-                    l_free = line_free_time[l_idx]
-                    real_start = max(l_free, min_start_time)
-                    
-                    # ----------------------------------------------------
-                    # ★ v6.5 核心判斷邏輯：急單絕對優先 vs 避免空轉 vs 分組
-                    # ----------------------------------------------------
-                    
-                    if is_rush:
-                        # [急單]: 完全不考慮分組與換線成本，只求「最快開工」
-                        # 我們直接用 real_start + s_time 作為絕對比較值
-                        score = real_start + s_time
-                        reason = "Rush"
-                    else:
-                        # [一般單]:
-                        # 我們計算兩個值：
-                        # 1. 實際開工時間 (time_cost) = real_start + s_time
-                        # 2. 分組加分 (group_bonus): 如果是同型號 (s_time==0)，我們讓它在分數上「看起來」提早了 45 分鐘
-                        #    這意味著：如果去別條線(要換線)能比在本線(同型號)提早 45 分鐘以上開工，那就換線！
-                        #    否則，寧願在本線排隊 (避免 8:03~9:18 這種為了省換線而導致的大段空轉)
-                        
-                        time_cost = real_start + s_time
-                        group_bonus = -45 if s_time == 0 else 0
-                        score = time_cost + group_bonus
-                        
-                        if s_time == 0: reason = "Group"
-                        else: reason = "Idle_Avoid"
-                    
-                    if score < possible_start:
-                        possible_start = score
-                        target_line_choice = l_idx
-                        setup_cost = s_time
-                        decision_reason = reason
-
-            # 3. Best Candidate Selection
-            if possible_start < 9999999:
-                if best_task_candidate is None or possible_start < best_task_candidate[1]:
-                      best_task_candidate = (i, possible_start, task, decision_reason)
-                
-                if possible_start <= min_start_time + 10 and setup_cost == 0:
-                    break
-        
-        # --- End of Scanning ---
-        if best_task_candidate:
-            task_idx, score_est, task, reason = best_task_candidate
-            pending_tasks.pop(task_idx)
-            
-            # --- 實際預約資源 (Real Booking) ---
-            manpower = int(task['Manpower_Req'])
-            total_man_minutes = float(task['Total_Man_Minutes'])
-            prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
-            is_offline = task['Is_Offline']
-            seq = task['Sequence']
-            order_id = str(task['Order_ID'])
-            base_model = task['Base_Model']
-
-            if is_offline:
-                start_limit = parse_time_to_mins(offline_settings["start"])
-                if order_id in order_target_line_map:
-                    t_idx = order_target_line_map[order_id]
-                    if 0 <= t_idx < len(line_free_time):
-                        jit_start = line_free_time[t_idx] - 2880 - prod_duration
-                        start_limit = max(start_limit, jit_start)
-            else:
-                start_limit = parse_time_to_mins(line_settings[0]["start"])
-            
-            min_start_time = start_limit
-            if seq > 1:
-                prev_seq = seq - 1
-                if (order_id, prev_seq) in order_finish_times:
-                    min_start_time = max(min_start_time, order_finish_times[(order_id, prev_seq)])
-
-            best_choice = None
-            
-            if is_offline:
-                off_cat = task['Process_Category']
-                limit = task['Concurrency_Limit']
-                candidate_stations = []
-                if limit == 0: pass 
-                else:
-                    for k in range(1, limit + 1):
-                        res_id = f"{off_cat}-{k}"
-                        if res_id not in offline_resource_usage:
-                            offline_resource_usage[res_id] = np.zeros(MAX_MINUTES, dtype=bool)
-                        candidate_stations.append(res_id)
-                stations_to_try = candidate_stations if candidate_stations else [None]
-                
-                for station_id in stations_to_try:
-                    res_usage_mask = offline_resource_usage[station_id] if station_id else None
-                    found = False
-                    t_search = min_start_time
-                    while not found and t_search < MAX_MINUTES - prod_duration:
-                        if not offline_mask[t_search]:
-                            t_search += 1
-                            continue
-                        s_val = offline_cumsum[t_search]
-                        t_val = s_val + prod_duration
-                        if t_val > offline_cumsum[-1]: break
-                        t_end = np.searchsorted(offline_cumsum, t_val)
-                        if np.any(offline_mask[t_search:t_end]): 
-                            i_mask = offline_mask[t_search:t_end]
-                            max_u = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
-                            resource_conflict = False
-                            if res_usage_mask is not None:
-                                if np.any(res_usage_mask[t_search:t_end]): resource_conflict = True
-                            if (max_u + manpower <= total_manpower) and (not resource_conflict):
-                                if best_choice is None or t_search < best_choice[0]:
-                                    best_choice = (t_search, t_end, station_id, 0)
-                                found = True
-                            else: t_search += 5
-                        else: t_search += 5
-            else:
-                # Online Booking
-                t_req = task['Target_Line']
-                c_lines = []
-                if t_req > 0: 
-                    t_idx = t_req - 4
-                    if 0 <= t_idx < total_lines: c_lines = [t_idx]
-                else:
-                    c_lines = [x for x in range(total_lines)]
-                    if str(base_model).startswith("N-DE") and total_lines >= 4: c_lines = [3]
-                    elif str(base_model).startswith("N-3610"):
-                        if total_lines >= 3: c_lines = [2] 
-                        else: c_lines = []
-
-                if not str(base_model).startswith("N-3610") and 2 in c_lines:
-                    c_lines.remove(2)
-
-                for l_idx in c_lines:
-                    curr_mask = line_masks[l_idx]
-                    curr_cumsum = line_cumsums[l_idx]
-                    s_time = 0
-                    if line_last_model[l_idx] is not None and line_last_model[l_idx] != base_model:
-                        s_time = changeover_mins
-                    
-                    t_start_search = max(line_free_time[l_idx], min_start_time)
-                    total_need = s_time + prod_duration
-                    
-                    found = False
-                    t_search = t_start_search
-                    while not found and t_search < MAX_MINUTES - total_need:
-                        if not curr_mask[t_search]:
-                            t_search += 1
-                            continue
-                        s_val = curr_cumsum[t_search]
-                        t_val = s_val + total_need
-                        if t_val > curr_cumsum[-1]: break
-                        t_end = np.searchsorted(curr_cumsum, t_val)
-                        if np.any(curr_mask[t_search:t_end]):
-                            i_mask = curr_mask[t_search:t_end]
-                            max_u = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
-                            if max_u + manpower <= total_manpower:
-                                 if best_choice is None or t_search < best_choice[0]:
-                                     best_choice = (t_search, t_end, l_idx, s_time)
-                                 found = True
-                            else: t_search += 5
-                        else: t_search += 5
-            
-            # Finalize
-            if best_choice:
-                status_msg = 'OK'
+                # 1. Dependency Check
+                start_limit = 0
                 if is_offline:
-                    final_start, final_end, final_station, this_setup = best_choice
-                    mask_slice = offline_mask[final_start:final_end]
-                    timeline_manpower[final_start:final_end][mask_slice] += manpower
-                    if final_station:
-                        offline_resource_usage[final_station][final_start:final_end] = True
-                        display_line = final_station
-                    else: display_line = task['Process_Category']
+                    start_limit = parse_time_to_mins(offline_settings["start"])
+                    if order_id in order_target_line_map:
+                        t_idx = order_target_line_map[order_id]
+                        if 0 <= t_idx < len(line_free_time):
+                            jit_start = line_free_time[t_idx] - 2880 - prod_duration
+                            start_limit = max(start_limit, jit_start)
                 else:
-                    final_start, final_end, final_line_idx, this_setup = best_choice
-                    curr_mask = line_masks[final_line_idx]
-                    mask_slice = curr_mask[final_start:final_end]
-                    timeline_manpower[final_start:final_end][mask_slice] += manpower
-                    line_usage_matrix[final_line_idx, final_start:final_end] = True
-                    line_free_time[final_line_idx] = final_end
-                    line_last_model[final_line_idx] = base_model
-                    display_line = f"Line {final_line_idx+4}"
+                    start_limit = parse_time_to_mins(line_settings[0]["start"])
 
-                if seq > 1 and prev_seq:
-                    if (order_id, prev_seq) in order_finish_times:
-                        prev_finish = order_finish_times[(order_id, prev_seq)]
-                        if (final_start - prev_finish) > 2880: status_msg = "WIP滯留(>2天)"
-
-                order_finish_times[(order_id, seq)] = final_end
+                min_start_time = start_limit
+                dependency_blocked = False
                 
-                results.append({
-                    '產線': display_line,
-                    '工單': task['Order_ID'], '產品': task['Product_ID'], 
-                    '數量': task['Qty'], '類別': '線外' if is_offline else '流水線', 
-                    '換線(分)': this_setup,
-                    '需求人力': manpower, '預計開始': format_time_str(final_start),
-                    '完工時間': format_time_str(final_end), '線佔用(分)': (final_end - final_start), 
-                    '狀態': status_msg, '排序用': final_end,
-                    '備註': task.get('Remarks', ''),
-                    '指定線': task.get('Line_Col', ''),
-                    '急單': 'Yes' if task.get('Order_Is_Rush') else '',
-                    '判斷': reason
-                })
+                if seq > 1:
+                    prev_seq = seq - 1
+                    if (order_id, prev_seq) in order_finish_times:
+                        min_start_time = max(min_start_time, order_finish_times[(order_id, prev_seq)])
+                    else:
+                        dependency_blocked = True
+                
+                if dependency_blocked:
+                    continue
+
+                # 2. Trial Scheduling
+                possible_start = 9999999
+                target_line_choice = -1
+                setup_cost = 0
+                decision_reason = ""
+                
+                if is_offline:
+                     off_cat = task['Process_Category']
+                     limit = task['Concurrency_Limit']
+                     stations = []
+                     if limit == 0: pass 
+                     else:
+                         for k in range(1, limit + 1):
+                             stations.append(f"{off_cat}-{k}")
+                     
+                     stations = stations if stations else [None]
+                     found_slot = False
+                     t_check = min_start_time
+                     for offset in range(0, 1000, 30): 
+                         t_probe = t_check + offset
+                         if t_probe >= MAX_MINUTES: break
+                         if not offline_mask[t_probe]: continue
+                         if stations[0] and stations[0] in offline_resource_usage:
+                             if offline_resource_usage[stations[0]][t_probe]: continue
+                         possible_start = min(possible_start, t_probe)
+                         found_slot = True
+                         break
+                     if not found_slot: continue 
+                          
+                else:
+                    # Online Booking
+                    t_req = task['Target_Line']
+                    c_lines = []
+                    
+                    if t_req > 0: 
+                        t_idx = t_req - 4
+                        if 0 <= t_idx < total_lines: c_lines = [t_idx]
+                    else:
+                        c_lines = [x for x in range(total_lines)]
+                        if str(base_model).startswith("N-DE") and total_lines >= 4: c_lines = [3]
+                        elif str(base_model).startswith("N-3610"):
+                             if total_lines >= 3: c_lines = [2]
+                             else: c_lines = []
+
+                    if not str(base_model).startswith("N-3610") and 2 in c_lines:
+                        c_lines.remove(2)
+                    
+                    if not c_lines: continue
+
+                    for l_idx in c_lines:
+                        s_time = 0
+                        if line_last_model[l_idx] is not None and line_last_model[l_idx] != base_model:
+                            s_time = changeover_mins
+                        
+                        l_free = line_free_time[l_idx]
+                        real_start = max(l_free, min_start_time)
+                        
+                        # ----------------------------------------------------
+                        # ★ 雙階段策略 ★
+                        # ----------------------------------------------------
+                        if is_rush_phase:
+                            # 【Phase 1: 急單】
+                            # 只看「完工時間」，誰快選誰。完全無視同型號加分。
+                            # Completion Time = Start + Setup + Duration
+                            score = real_start + s_time + prod_duration
+                            reason = "Rush_Phase"
+                        else:
+                            # 【Phase 2: 一般單】
+                            # Smart Grouping: 容忍 45 分鐘的等待。
+                            # 如果去別條線(要換線)的完工時間，比在本條線(不用換線)還快 45 分鐘以上，那就換線。
+                            # 否則，優先留在同型號產線。
+                            
+                            completion_time = real_start + s_time + prod_duration
+                            group_bonus = -45 if s_time == 0 else 0
+                            score = completion_time + group_bonus
+                            
+                            if s_time == 0: reason = "Group"
+                            else: reason = "Idle_Avoid"
+                        
+                        if score < possible_start:
+                            possible_start = score
+                            target_line_choice = l_idx
+                            setup_cost = s_time
+                            decision_reason = reason
+
+                # 3. Best Candidate Selection
+                if possible_start < 9999999:
+                    if best_task_candidate is None or possible_start < best_task_candidate[1]:
+                          best_task_candidate = (i, possible_start, task, decision_reason)
+                    
+                    if possible_start <= min_start_time + 10 and setup_cost == 0:
+                        break
+            
+            # --- End of Scanning for this loop ---
+            if best_task_candidate:
+                task_idx, score_est, task, reason = best_task_candidate
+                pending_tasks.pop(task_idx)
+                
+                # Copy-paste Booking Logic
+                manpower = int(task['Manpower_Req'])
+                total_man_minutes = float(task['Total_Man_Minutes'])
+                prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
+                is_offline = task['Is_Offline']
+                seq = task['Sequence']
+                order_id = str(task['Order_ID'])
+                base_model = task['Base_Model']
+
+                if is_offline:
+                    start_limit = parse_time_to_mins(offline_settings["start"])
+                    if order_id in order_target_line_map:
+                        t_idx = order_target_line_map[order_id]
+                        if 0 <= t_idx < len(line_free_time):
+                            jit_start = line_free_time[t_idx] - 2880 - prod_duration
+                            start_limit = max(start_limit, jit_start)
+                else:
+                    start_limit = parse_time_to_mins(line_settings[0]["start"])
+                
+                min_start_time = start_limit
+                if seq > 1:
+                    prev_seq = seq - 1
+                    if (order_id, prev_seq) in order_finish_times:
+                        min_start_time = max(min_start_time, order_finish_times[(order_id, prev_seq)])
+
+                best_choice = None
+                
+                if is_offline:
+                    off_cat = task['Process_Category']
+                    limit = task['Concurrency_Limit']
+                    candidate_stations = []
+                    if limit == 0: pass 
+                    else:
+                        for k in range(1, limit + 1):
+                            res_id = f"{off_cat}-{k}"
+                            if res_id not in offline_resource_usage:
+                                offline_resource_usage[res_id] = np.zeros(MAX_MINUTES, dtype=bool)
+                            candidate_stations.append(res_id)
+                    stations_to_try = candidate_stations if candidate_stations else [None]
+                    
+                    for station_id in stations_to_try:
+                        res_usage_mask = offline_resource_usage[station_id] if station_id else None
+                        found = False
+                        t_search = min_start_time
+                        while not found and t_search < MAX_MINUTES - prod_duration:
+                            if not offline_mask[t_search]:
+                                t_search += 1
+                                continue
+                            s_val = offline_cumsum[t_search]
+                            t_val = s_val + prod_duration
+                            if t_val > offline_cumsum[-1]: break
+                            t_end = np.searchsorted(offline_cumsum, t_val)
+                            if np.any(offline_mask[t_search:t_end]): 
+                                i_mask = offline_mask[t_search:t_end]
+                                max_u = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
+                                resource_conflict = False
+                                if res_usage_mask is not None:
+                                    if np.any(res_usage_mask[t_search:t_end]): resource_conflict = True
+                                if (max_u + manpower <= total_manpower) and (not resource_conflict):
+                                    if best_choice is None or t_search < best_choice[0]:
+                                        best_choice = (t_search, t_end, station_id, 0)
+                                    found = True
+                                else: t_search += 5
+                            else: t_search += 5
+                else:
+                    t_req = task['Target_Line']
+                    c_lines = []
+                    if t_req > 0: 
+                        t_idx = t_req - 4
+                        if 0 <= t_idx < total_lines: c_lines = [t_idx]
+                    else:
+                        c_lines = [x for x in range(total_lines)]
+                        if str(base_model).startswith("N-DE") and total_lines >= 4: c_lines = [3]
+                        elif str(base_model).startswith("N-3610"):
+                            if total_lines >= 3: c_lines = [2] 
+                            else: c_lines = []
+
+                    if not str(base_model).startswith("N-3610") and 2 in c_lines:
+                        c_lines.remove(2)
+
+                    for l_idx in c_lines:
+                        curr_mask = line_masks[l_idx]
+                        curr_cumsum = line_cumsums[l_idx]
+                        s_time = 0
+                        if line_last_model[l_idx] is not None and line_last_model[l_idx] != base_model:
+                            s_time = changeover_mins
+                        
+                        t_start_search = max(line_free_time[l_idx], min_start_time)
+                        total_need = s_time + prod_duration
+                        
+                        found = False
+                        t_search = t_start_search
+                        while not found and t_search < MAX_MINUTES - total_need:
+                            if not curr_mask[t_search]:
+                                t_search += 1
+                                continue
+                            s_val = curr_cumsum[t_search]
+                            t_val = s_val + total_need
+                            if t_val > curr_cumsum[-1]: break
+                            t_end = np.searchsorted(curr_cumsum, t_val)
+                            if np.any(curr_mask[t_search:t_end]):
+                                i_mask = curr_mask[t_search:t_end]
+                                max_u = np.max(timeline_manpower[t_search:t_end][i_mask]) if np.any(i_mask) else 0
+                                if max_u + manpower <= total_manpower:
+                                     if best_choice is None or t_search < best_choice[0]:
+                                         best_choice = (t_search, t_end, l_idx, s_time)
+                                     found = True
+                                else: t_search += 5
+                            else: t_search += 5
+                
+                # Apply
+                if best_choice:
+                    status_msg = 'OK'
+                    if is_offline:
+                        final_start, final_end, final_station, this_setup = best_choice
+                        mask_slice = offline_mask[final_start:final_end]
+                        timeline_manpower[final_start:final_end][mask_slice] += manpower
+                        if final_station:
+                            offline_resource_usage[final_station][final_start:final_end] = True
+                            display_line = final_station
+                        else: display_line = task['Process_Category']
+                    else:
+                        final_start, final_end, final_line_idx, this_setup = best_choice
+                        curr_mask = line_masks[final_line_idx]
+                        mask_slice = curr_mask[final_start:final_end]
+                        timeline_manpower[final_start:final_end][mask_slice] += manpower
+                        line_usage_matrix[final_line_idx, final_start:final_end] = True
+                        line_free_time[final_line_idx] = final_end
+                        line_last_model[final_line_idx] = base_model
+                        display_line = f"Line {final_line_idx+4}"
+
+                    if seq > 1 and prev_seq:
+                        if (order_id, prev_seq) in order_finish_times:
+                            prev_finish = order_finish_times[(order_id, prev_seq)]
+                            if (final_start - prev_finish) > 2880: status_msg = "WIP滯留(>2天)"
+
+                    order_finish_times[(order_id, seq)] = final_end
+                    
+                    results.append({
+                        '產線': display_line,
+                        '工單': task['Order_ID'], '產品': task['Product_ID'], 
+                        '數量': task['Qty'], '類別': '線外' if is_offline else '流水線', 
+                        '換線(分)': this_setup,
+                        '需求人力': manpower, '預計開始': format_time_str(final_start),
+                        '完工時間': format_time_str(final_end), '線佔用(分)': (final_end - final_start), 
+                        '狀態': status_msg, '排序用': final_end,
+                        '備註': task.get('Remarks', ''),
+                        '指定線': task.get('Line_Col', ''),
+                        '急單': 'Yes' if task.get('Order_Is_Rush') else '',
+                        '判斷': reason
+                    })
+                else:
+                    results.append({'工單': task['Order_ID'], '狀態': '失敗(無資源)', '備註': '找不到空檔'})
+            
             else:
-                results.append({'工單': task['Order_ID'], '狀態': '失敗(無資源)', '備註': '找不到空檔'})
-        
-        else:
-            break
+                # No valid task found in this pass
+                break
+
+    # =========================================================================
+    # 執行排程：先 Rush，再 Normal
+    # =========================================================================
+    schedule_task_list(tasks_rush, is_rush_phase=True)
+    schedule_task_list(tasks_normal, is_rush_phase=False)
 
     if results:
         last_time = max([r['排序用'] for r in results if r.get('狀態') in ['OK', 'WIP滯留(>2天)']], default=0)
