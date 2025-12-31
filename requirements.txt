@@ -1,5 +1,5 @@
 streamlit==1.32.0
 # 如果您的 app01.py 有用到 pandas，請加上下面這行
 pandas==2.2.0
-# 如果有用到 numpy，請加上下面這行
+# 如果有用到 numpy，請加上下面這行 
 numpy==1.26.4
