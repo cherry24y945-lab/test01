@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數
 # ==========================================
-SYSTEM_VERSION = "v6.2 (Strict Grouping: High Changeover Penalty)"
+SYSTEM_VERSION = "v6.3 (Fix: Maximize Utilization & Rush Logic)"
 
 # 線外製程分類與資源限制
 OFFLINE_CONFIG = {
@@ -39,6 +39,7 @@ def create_line_mask(start_str, end_str, days=14):
     mask = np.zeros(total_minutes, dtype=bool)
     start_min = parse_time_to_mins(start_str)
     end_min = parse_time_to_mins(end_str)
+    # 固定休息時間
     breaks = [(600, 605), (720, 780), (900, 905), (1020, 1050)]
     
     for day in range(days):
@@ -231,7 +232,7 @@ def load_and_clean_data(uploaded_file):
         return None, str(e)
 
 # ==========================================
-# 3. 排程運算區 (Fixed Grouping Logic)
+# 3. 排程運算區 (Balanced Logic)
 # ==========================================
 def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings, offline_settings):
     MAX_MINUTES = 14 * 24 * 60 
@@ -248,6 +249,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
 
     timeline_manpower = np.zeros(MAX_MINUTES, dtype=int)
     line_usage_matrix = np.zeros((total_lines, MAX_MINUTES), dtype=bool)
+    # Reset line_free_time to daily start for better initial filling
     line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
     
     offline_resource_usage = {}
@@ -275,7 +277,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     rush_orders_global = df[df['Is_Rush']]['Order_ID'].unique()
     df['Order_Is_Rush'] = df['Order_ID'].isin(rush_orders_global)
     
-    # 嚴格排序：急單 > 產品 > 順序
+    # 優先級：急單 > 產品 > 順序
     df_sorted = df.sort_values(
         by=['Order_Is_Rush', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
         ascending=[False, True, True, True, True]
@@ -289,18 +291,15 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     max_loops = len(pending_tasks) * 5 
     loop_count = 0
     
-    # ★★★ New: Limit search depth to prioritize list order over global optimization ★★★
-    SEARCH_DEPTH = 50 
-
+    # Removed SEARCH_DEPTH limit to allow full scan for best utilization
+    
     while pending_tasks and loop_count < max_loops:
         loop_count += 1
         
         best_task_candidate = None 
         
-        # 掃描 Pending List (Limited Depth)
+        # 掃描 Pending List
         for i, task in enumerate(pending_tasks):
-            if i >= SEARCH_DEPTH: break # Stop searching too far down to preserve order
-
             manpower = int(task['Manpower_Req'])
             total_man_minutes = float(task['Total_Man_Minutes'])
             prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
@@ -309,6 +308,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             seq = task['Sequence']
             order_id = str(task['Order_ID'])
             base_model = task['Base_Model']
+            is_rush = task['Order_Is_Rush']
 
             # 1. Dependency Check
             start_limit = 0
@@ -391,37 +391,50 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
 
                 for l_idx in c_lines:
                     s_time = 0
-                    # ★★★ New: Massive Penalty for Changeover to force Grouping ★★★
-                    # If this line was running a different model, penalty is high.
-                    # If this line matches current model, penalty is 0.
+                    # Normal setup calculation
                     if line_last_model[l_idx] is not None and line_last_model[l_idx] != base_model:
-                        s_time = changeover_mins * 100 # Artificially high cost
+                        s_time = changeover_mins
                     
                     l_free = line_free_time[l_idx]
                     real_start = max(l_free, min_start_time)
-                    gap = real_start - l_free
                     
-                    # Score = Time + High Penalty. 
-                    # This ensures we prefer waiting for the "Correct Line" rather than switching to an empty "Wrong Line"
-                    score = real_start + s_time 
+                    # 邏輯核心：比的是「完工時間」
+                    # 如果能提早完工，就算要換線也值得
+                    # If we switch line: real_start + setup + duration
+                    # If we wait: real_start (which might be late) + 0 + duration
+                    
+                    completion_time = real_start + s_time + prod_duration
+                    
+                    # Score is essentially the completion time
+                    score = completion_time
+                    
+                    # Tie-Breaker: Prefer same line if completion times are very close
+                    # If setups are 0, subtract a tiny bonus to prefer this line
+                    if s_time == 0:
+                        score -= 10 # Bonus for grouping preference if time is comparable
+                    
+                    # Rush Order Logic: Absolute Priority on Earliest FINISH
+                    if is_rush:
+                        score = completion_time # No grouping bias, just speed
                     
                     if score < possible_start:
                         possible_start = score
                         target_line_choice = l_idx
-                        setup_cost = changeover_mins if s_time > 0 else 0
+                        setup_cost = s_time
 
             # 3. Best Candidate Selection
             if possible_start < 9999999:
                 if best_task_candidate is None or possible_start < best_task_candidate[1]:
                       best_task_candidate = (i, possible_start, task)
                 
-                # If we found a perfect slot (no delay, no setup), grab it immediately
-                if possible_start <= min_start_time + 10 and setup_cost == 0:
+                # Dynamic Break: If we found a slot that starts almost immediately without setup
+                # We take it.
+                if possible_start <= min_start_time + prod_duration + 10 and setup_cost == 0:
                     break
         
         # --- End of Scanning ---
         if best_task_candidate:
-            task_idx, start_time_est, task = best_task_candidate
+            task_idx, score_est, task = best_task_candidate
             pending_tasks.pop(task_idx)
             
             # --- 實際預約資源 (Real Booking) ---
