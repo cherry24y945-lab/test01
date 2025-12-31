@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數
 # ==========================================
-SYSTEM_VERSION = "v6.7 (Final: Product Continuity & Designated Line Fix)"
+SYSTEM_VERSION = "v6.8 (Final: Rush First -> Designated Hard Lock -> Strong Continuity)"
 
 # 線外製程分類與資源限制
 OFFLINE_CONFIG = {
@@ -39,6 +39,7 @@ def create_line_mask(start_str, end_str, days=14):
     mask = np.zeros(total_minutes, dtype=bool)
     start_min = parse_time_to_mins(start_str)
     end_min = parse_time_to_mins(end_str)
+    # 固定休息時間
     breaks = [(600, 605), (720, 780), (900, 905), (1020, 1050)]
     
     for day in range(days):
@@ -283,11 +284,12 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         ascending=[True, True, True, True]
     )
     
-    # Phase 2: 一般單 (Sort by Line_Col to ensure designated lines are handled, then by Model)
-    # Adding 'Target_Line' to sort key to group designated tasks together
+    # Phase 2: 一般單 (Sort by Has_Target_Line desc, then Base_Model)
+    # This puts orders with designated lines at the top of the queue for the normal phase
+    df['Has_Target_Line'] = df['Target_Line'] > 0
     df_normal = df[~df['Order_Is_Rush']].sort_values(
-        by=['Target_Line', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
-        ascending=[False, True, True, True, True]
+        by=['Has_Target_Line', 'Target_Line', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
+        ascending=[False, True, True, True, True, True]
     )
     
     tasks_rush = df_rush.to_dict('records')
@@ -398,7 +400,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                         real_start = max(l_free, min_start_time)
                         
                         # ----------------------------------------------------
-                        # ★ 核心邏輯 v6.7 ★
+                        # ★ 核心邏輯 v6.8: 指定線硬性鎖定 & 同型號強力磁鐵 ★
                         # ----------------------------------------------------
                         if is_rush_phase:
                             # 【Phase 1: 急單】 無視一切，只求最快完工
@@ -406,25 +408,23 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                             reason = "Rush_Phase"
                         else:
                             # 【Phase 2: 一般單】
-                            # 1. 指定線權重：如果這張單有指定線 (t_req > 0)，且當前檢查的線就是指定線
-                            #    給予超級加分，強制它排進這條線 (除非這條線已經滿到明年)
-                            designated_bonus = -99999 if (t_req > 0 and (t_req-4) == l_idx) else 0
                             
-                            # 2. 同型號銜接 (Product Continuity)：
-                            #    如果這條線最後一個產品跟現在一樣 (s_time == 0)，給予高加分 (-180分)
-                            #    這代表我們願意為了接續生產，多等待 3 小時。
-                            #    這能解決 "明明有線剛做完同產品，卻跑去別條空線" 的問題。
-                            continuity_bonus = -180 if s_time == 0 else 0
-                            
-                            # 3. 避免空轉 (Idle Avoidance)：
-                            #    如果真的要等太久 (超過 continuity_bonus 的容忍)，才會去別條線。
-                            
-                            completion_time = real_start + s_time + prod_duration
-                            score = completion_time + designated_bonus + continuity_bonus
-                            
-                            if t_req > 0: reason = "Designated"
-                            elif s_time == 0: reason = "Continuity"
-                            else: reason = "Idle_Avoid"
+                            # 1. 指定線 (Hard Lock):
+                            # 如果這張單有指定線，而目前 loop 的線不是那一條 -> Score = 無窮大 (剔除)
+                            if t_req > 0 and (t_req-4) != l_idx:
+                                score = 9999999
+                                reason = "Wrong_Line"
+                            else:
+                                # 2. 同型號強力磁鐵 (Strong Continuity):
+                                # 如果這條線剛做完同型號 (s_time == 0)，我們給予極高的容忍度 (-720分 = 12小時)
+                                # 除非這條線要等超過 12 小時，否則絕對優先排進來
+                                continuity_bonus = -720 if s_time == 0 else 0
+                                
+                                completion_time = real_start + s_time + prod_duration
+                                score = completion_time + continuity_bonus
+                                
+                                if s_time == 0: reason = "Continuity_Lock"
+                                else: reason = "Fill_Gap"
                         
                         if score < possible_start:
                             possible_start = score
