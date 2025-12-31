@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數
 # ==========================================
-SYSTEM_VERSION = "v6.9 (Logic: Rush First -> Continuity < 15mins -> Fill Gap)"
+SYSTEM_VERSION = "v6.9.1 (Logic: Rush First -> Continuity < 15mins -> Fill Gap)"
 
 # 線外製程分類與資源限制
 OFFLINE_CONFIG = {
@@ -39,7 +39,6 @@ def create_line_mask(start_str, end_str, days=14):
     mask = np.zeros(total_minutes, dtype=bool)
     start_min = parse_time_to_mins(start_str)
     end_min = parse_time_to_mins(end_str)
-    # 固定休息時間
     breaks = [(600, 605), (720, 780), (900, 905), (1020, 1050)]
     
     for day in range(days):
@@ -278,17 +277,17 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     rush_orders_global = df[df['Is_Rush']]['Order_ID'].unique()
     df['Order_Is_Rush'] = df['Order_ID'].isin(rush_orders_global)
     
-    # Phase 1: 急單 (優先)
+    # Phase 1: 急單
     df_rush = df[df['Order_Is_Rush']].sort_values(
         by=['Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
         ascending=[True, True, True, True]
     )
     
-    # Phase 2: 一般單 (Target Line First -> Base_Model -> Seq)
+    # Phase 2: 一般單 (Sort by Base_Model first to group similar products)
     df['Has_Target_Line'] = df['Target_Line'] > 0
     df_normal = df[~df['Order_Is_Rush']].sort_values(
-        by=['Has_Target_Line', 'Target_Line', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
-        ascending=[False, True, True, True, True, True]
+        by=['Base_Model', 'Has_Target_Line', 'Order_ID', 'Sequence', 'Priority'], 
+        ascending=[True, False, True, True, True]
     )
     
     tasks_rush = df_rush.to_dict('records')
@@ -397,7 +396,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                         real_start = max(l_free, min_start_time)
                         
                         # ----------------------------------------------------
-                        # ★ 核心邏輯 v6.9: Rush vs 15-min Continuity Rule ★
+                        # ★ 核心邏輯 v6.9.1: Rush vs 15-min Continuity Rule ★
                         # ----------------------------------------------------
                         if is_rush_phase:
                             # 【Phase 1: 急單】只求最快開始
@@ -418,12 +417,10 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                                     wait_time = real_start - l_free
                                     if wait_time <= 15:
                                         # (2.1) 等待 <= 15分鐘 -> 強制鎖定接續!
-                                        # 給予超級加分，確保不會被其他產品插隊
                                         continuity_bonus = -999999 
                                         reason = "Continuity<15m"
                                     else:
                                         # (2.2) 等待 > 15分鐘 -> 放棄優先權
-                                        # 視為一般填補，允許其他產品(如果更快)插隊
                                         continuity_bonus = 0
                                         reason = "Wait>15m_FillGap"
                                 else:
@@ -444,7 +441,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     if best_task_candidate is None or possible_start < best_task_candidate[1]:
                           best_task_candidate = (i, possible_start, task, decision_reason)
                     
-                    # 完美匹配 (無換線且馬上開始)，直接中斷掃描加速
                     if possible_start <= min_start_time + 10 and setup_cost == 0:
                         break
             
