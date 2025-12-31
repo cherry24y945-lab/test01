@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數
 # ==========================================
-SYSTEM_VERSION = "v6.1 (Fix: N-3610 exclusive to Line 6)"
+SYSTEM_VERSION = "v6.2 (Strict Grouping: High Changeover Penalty)"
 
 # 線外製程分類與資源限制
 OFFLINE_CONFIG = {
@@ -231,7 +231,7 @@ def load_and_clean_data(uploaded_file):
         return None, str(e)
 
 # ==========================================
-# 3. 排程運算區 (Anti-Starvation + New Constraints)
+# 3. 排程運算區 (Fixed Grouping Logic)
 # ==========================================
 def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings, offline_settings):
     MAX_MINUTES = 14 * 24 * 60 
@@ -261,13 +261,12 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
         if t_line > 0: 
             target_idx = t_line - 4
         else:
-            # 預設邏輯 (index 0 = Line 4, index 2 = Line 6)
             if str(row['Base_Model']).startswith("N-DE") and total_lines >= 4:
                 target_idx = 3 # Line 7
             elif str(row['Base_Model']).startswith("N-3610") and total_lines >= 3:
-                target_idx = 2 # Line 6 (Index 2) [FIXED Logic]
+                target_idx = 2 # Line 6 (Index 2)
             else:
-                target_idx = 0 # Default Line 4 (but not enforced)
+                target_idx = 0 # Default Line 4
                 
         if row['Order_ID'] not in order_target_line_map:
             order_target_line_map[row['Order_ID']] = target_idx
@@ -276,7 +275,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     rush_orders_global = df[df['Is_Rush']]['Order_ID'].unique()
     df['Order_Is_Rush'] = df['Order_ID'].isin(rush_orders_global)
     
-    # 原始順序：急單 > 產品 > 順序
+    # 嚴格排序：急單 > 產品 > 順序
     df_sorted = df.sort_values(
         by=['Order_Is_Rush', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
         ascending=[False, True, True, True, True]
@@ -284,20 +283,24 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     
     line_last_model = {i: None for i in range(total_lines)}
     
-    # ★★★ Anti-Starvation: 使用 Pending List 進行動態填補 ★★★
     pending_tasks = df_sorted.to_dict('records')
     results = []
     
     max_loops = len(pending_tasks) * 5 
     loop_count = 0
     
+    # ★★★ New: Limit search depth to prioritize list order over global optimization ★★★
+    SEARCH_DEPTH = 50 
+
     while pending_tasks and loop_count < max_loops:
         loop_count += 1
         
         best_task_candidate = None 
         
-        # 掃描 Pending List
+        # 掃描 Pending List (Limited Depth)
         for i, task in enumerate(pending_tasks):
+            if i >= SEARCH_DEPTH: break # Stop searching too far down to preserve order
+
             manpower = int(task['Manpower_Req'])
             total_man_minutes = float(task['Total_Man_Minutes'])
             prod_duration = int(np.ceil(total_man_minutes / manpower)) if manpower > 0 else 0
@@ -313,7 +316,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                 start_limit = parse_time_to_mins(offline_settings["start"])
                 if order_id in order_target_line_map:
                     t_idx = order_target_line_map[order_id]
-                    # 安全檢查，避免索引越界
                     if 0 <= t_idx < len(line_free_time):
                         jit_start = line_free_time[t_idx] - 2880 - prod_duration
                         start_limit = max(start_limit, jit_start)
@@ -339,7 +341,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             setup_cost = 0
             
             if is_offline:
-                 # 線外試算 (省略細節，與原邏輯相同)
+                 # 線外試算 (Same as before)
                  off_cat = task['Process_Category']
                  limit = task['Concurrency_Limit']
                  stations = []
@@ -362,61 +364,58 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                      possible_start = min(possible_start, t_probe)
                      found_slot = True
                      break
-                 if not found_slot: continue # Skip if no slot found nearby
+                 if not found_slot: continue 
                       
             else:
                 # Online Booking - Candidate Selection
                 t_req = task['Target_Line']
                 c_lines = []
                 
-                # 指定線優先
                 if t_req > 0: 
                     t_idx = t_req - 4
                     if 0 <= t_idx < total_lines: c_lines = [t_idx]
                 else:
-                    # 預設全選
                     c_lines = [x for x in range(total_lines)]
-                    
-                    # 規則 1: N-DE* 優先去 Line 7 (Index 3)
-                    if str(base_model).startswith("N-DE") and total_lines >= 4:
-                         c_lines = [3]
-                    
-                    # 規則 2: N-3610* 強制去 Line 6 (Index 2) [FIXED Logic]
+                    # N-DE Rule
+                    if str(base_model).startswith("N-DE") and total_lines >= 4: c_lines = [3]
+                    # N-3610 Rule
                     elif str(base_model).startswith("N-3610"):
-                         if total_lines >= 3:
-                             c_lines = [2] # 鎖定 Line 6
-                         else:
-                             c_lines = [] # 無產線可用
+                         if total_lines >= 3: c_lines = [2]
+                         else: c_lines = []
 
-                # 規則 3: Line 6 專屬於 N-3610* (其他產品不能用) [FIXED Logic]
-                # 如果當前產品不是 N-3610*，則從候選名單中移除 Index 2 (Line 6)
+                # Protect Line 6
                 if not str(base_model).startswith("N-3610") and 2 in c_lines:
                     c_lines.remove(2)
                 
-                # 如果沒有可用產線，跳過
-                if not c_lines:
-                    continue
+                if not c_lines: continue
 
                 for l_idx in c_lines:
                     s_time = 0
+                    # ★★★ New: Massive Penalty for Changeover to force Grouping ★★★
+                    # If this line was running a different model, penalty is high.
+                    # If this line matches current model, penalty is 0.
                     if line_last_model[l_idx] is not None and line_last_model[l_idx] != base_model:
-                        s_time = changeover_mins
+                        s_time = changeover_mins * 100 # Artificially high cost
                     
                     l_free = line_free_time[l_idx]
                     real_start = max(l_free, min_start_time)
                     gap = real_start - l_free
-                    score = real_start + (s_time * 0.5) 
+                    
+                    # Score = Time + High Penalty. 
+                    # This ensures we prefer waiting for the "Correct Line" rather than switching to an empty "Wrong Line"
+                    score = real_start + s_time 
                     
                     if score < possible_start:
                         possible_start = score
                         target_line_choice = l_idx
-                        setup_cost = s_time
+                        setup_cost = changeover_mins if s_time > 0 else 0
 
             # 3. Best Candidate Selection
             if possible_start < 9999999:
                 if best_task_candidate is None or possible_start < best_task_candidate[1]:
                       best_task_candidate = (i, possible_start, task)
                 
+                # If we found a perfect slot (no delay, no setup), grab it immediately
                 if possible_start <= min_start_time + 10 and setup_cost == 0:
                     break
         
@@ -454,7 +453,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             best_choice = None
             
             if is_offline:
-                # (與原邏輯相同)
+                # (Offline logic remains same)
                 off_cat = task['Process_Category']
                 limit = task['Concurrency_Limit']
                 candidate_stations = []
@@ -500,14 +499,11 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     if 0 <= t_idx < total_lines: c_lines = [t_idx]
                 else:
                     c_lines = [x for x in range(total_lines)]
-                    # N-DE Rule
                     if str(base_model).startswith("N-DE") and total_lines >= 4: c_lines = [3]
-                    # N-3610 Rule [FIXED Logic]
                     elif str(base_model).startswith("N-3610"):
-                        if total_lines >= 3: c_lines = [2] # Line 6 (Index 2)
+                        if total_lines >= 3: c_lines = [2] 
                         else: c_lines = []
 
-                # Protect Line 6 [FIXED Logic]
                 if not str(base_model).startswith("N-3610") and 2 in c_lines:
                     c_lines.remove(2)
 
