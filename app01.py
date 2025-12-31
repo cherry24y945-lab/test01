@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數
 # ==========================================
-SYSTEM_VERSION = "v6.4 (Final: Absolute Rush Priority & Smart Grouping)"
+SYSTEM_VERSION = "v6.5 (Final: Real-Time Idle Filling & Absolute Rush)"
 
 # 線外製程分類與資源限制
 OFFLINE_CONFIG = {
@@ -232,7 +232,7 @@ def load_and_clean_data(uploaded_file):
         return None, str(e)
 
 # ==========================================
-# 3. 排程運算區 (Absolute Rush & Smart Grouping)
+# 3. 排程運算區 (Fixed: Rush Priority & Anti-Idle)
 # ==========================================
 def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings, offline_settings):
     MAX_MINUTES = 14 * 24 * 60 
@@ -276,7 +276,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     rush_orders_global = df[df['Is_Rush']]['Order_ID'].unique()
     df['Order_Is_Rush'] = df['Order_ID'].isin(rush_orders_global)
     
-    # 排序：急單 -> Base_Model -> 順序
+    # 排序：急單 > 產品 > 順序
     df_sorted = df.sort_values(
         by=['Order_Is_Rush', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
         ascending=[False, True, True, True, True]
@@ -292,7 +292,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     
     while pending_tasks and loop_count < max_loops:
         loop_count += 1
-        
         best_task_candidate = None 
         
         # 掃描 Pending List
@@ -336,9 +335,9 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             possible_start = 9999999
             target_line_choice = -1
             setup_cost = 0
+            decision_reason = ""
             
             if is_offline:
-                 # 線外試算
                  off_cat = task['Process_Category']
                  limit = task['Concurrency_Limit']
                  stations = []
@@ -391,37 +390,47 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     l_free = line_free_time[l_idx]
                     real_start = max(l_free, min_start_time)
                     
-                    # 邏輯核心 v6.4
+                    # ----------------------------------------------------
+                    # ★ v6.5 核心判斷邏輯：急單絕對優先 vs 避免空轉 vs 分組
+                    # ----------------------------------------------------
+                    
                     if is_rush:
-                        # ★ 急單：絕對優先，只看完工時間，無視任何分組偏好
+                        # [急單]: 完全不考慮分組與換線成本，只求「最快開工」
+                        # 我們直接用 real_start + s_time 作為絕對比較值
                         score = real_start + s_time
+                        reason = "Rush"
                     else:
-                        # ★ 一般單：有條件分組 (Smart Grouping)
-                        # 如果是同型號 (s_time == 0)，給予一個 "Group Bonus" (減分)
-                        # 這代表：我們願意為了同型號，多等待 60 分鐘。
-                        # 如果等待時間超過 60 分鐘，Bonus 就無法抵消延遲，系統就會選擇換線。
+                        # [一般單]:
+                        # 我們計算兩個值：
+                        # 1. 實際開工時間 (time_cost) = real_start + s_time
+                        # 2. 分組加分 (group_bonus): 如果是同型號 (s_time==0)，我們讓它在分數上「看起來」提早了 45 分鐘
+                        #    這意味著：如果去別條線(要換線)能比在本線(同型號)提早 45 分鐘以上開工，那就換線！
+                        #    否則，寧願在本線排隊 (避免 8:03~9:18 這種為了省換線而導致的大段空轉)
                         
                         time_cost = real_start + s_time
-                        group_bonus = -60 if s_time == 0 else 0
+                        group_bonus = -45 if s_time == 0 else 0
                         score = time_cost + group_bonus
+                        
+                        if s_time == 0: reason = "Group"
+                        else: reason = "Idle_Avoid"
                     
                     if score < possible_start:
                         possible_start = score
                         target_line_choice = l_idx
                         setup_cost = s_time
+                        decision_reason = reason
 
             # 3. Best Candidate Selection
             if possible_start < 9999999:
                 if best_task_candidate is None or possible_start < best_task_candidate[1]:
-                      best_task_candidate = (i, possible_start, task)
+                      best_task_candidate = (i, possible_start, task, decision_reason)
                 
-                # 如果找到一個完美空檔，直接執行 (加速運算)
                 if possible_start <= min_start_time + 10 and setup_cost == 0:
                     break
         
         # --- End of Scanning ---
         if best_task_candidate:
-            task_idx, score_est, task = best_task_candidate
+            task_idx, score_est, task, reason = best_task_candidate
             pending_tasks.pop(task_idx)
             
             # --- 實際預約資源 (Real Booking) ---
@@ -573,7 +582,8 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     '狀態': status_msg, '排序用': final_end,
                     '備註': task.get('Remarks', ''),
                     '指定線': task.get('Line_Col', ''),
-                    '急單': 'Yes' if task.get('Order_Is_Rush') else ''
+                    '急單': 'Yes' if task.get('Order_Is_Rush') else '',
+                    '判斷': reason
                 })
             else:
                 results.append({'工單': task['Order_ID'], '狀態': '失敗(無資源)', '備註': '找不到空檔'})
