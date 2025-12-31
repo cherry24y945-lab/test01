@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數
 # ==========================================
-SYSTEM_VERSION = "v6.3 (Fix: Maximize Utilization & Rush Logic)"
+SYSTEM_VERSION = "v6.4 (Final: Absolute Rush Priority & Smart Grouping)"
 
 # 線外製程分類與資源限制
 OFFLINE_CONFIG = {
@@ -232,7 +232,7 @@ def load_and_clean_data(uploaded_file):
         return None, str(e)
 
 # ==========================================
-# 3. 排程運算區 (Balanced Logic)
+# 3. 排程運算區 (Absolute Rush & Smart Grouping)
 # ==========================================
 def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings, offline_settings):
     MAX_MINUTES = 14 * 24 * 60 
@@ -249,13 +249,12 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
 
     timeline_manpower = np.zeros(MAX_MINUTES, dtype=int)
     line_usage_matrix = np.zeros((total_lines, MAX_MINUTES), dtype=bool)
-    # Reset line_free_time to daily start for better initial filling
     line_free_time = [parse_time_to_mins(setting["start"]) for setting in line_settings]
     
     offline_resource_usage = {}
     order_finish_times = {}
     
-    # 預判 Target Line (用於 JIT 推算)
+    # 預判 Target Line
     df_online_parts = df[df['Is_Offline'] == False]
     order_target_line_map = {}
     for _, row in df_online_parts.iterrows():
@@ -266,7 +265,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             if str(row['Base_Model']).startswith("N-DE") and total_lines >= 4:
                 target_idx = 3 # Line 7
             elif str(row['Base_Model']).startswith("N-3610") and total_lines >= 3:
-                target_idx = 2 # Line 6 (Index 2)
+                target_idx = 2 # Line 6
             else:
                 target_idx = 0 # Default Line 4
                 
@@ -277,7 +276,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     rush_orders_global = df[df['Is_Rush']]['Order_ID'].unique()
     df['Order_Is_Rush'] = df['Order_ID'].isin(rush_orders_global)
     
-    # 優先級：急單 > 產品 > 順序
+    # 排序：急單 -> Base_Model -> 順序
     df_sorted = df.sort_values(
         by=['Order_Is_Rush', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
         ascending=[False, True, True, True, True]
@@ -290,8 +289,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     
     max_loops = len(pending_tasks) * 5 
     loop_count = 0
-    
-    # Removed SEARCH_DEPTH limit to allow full scan for best utilization
     
     while pending_tasks and loop_count < max_loops:
         loop_count += 1
@@ -341,7 +338,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             setup_cost = 0
             
             if is_offline:
-                 # 線外試算 (Same as before)
+                 # 線外邏輯 (維持不變)
                  off_cat = task['Process_Category']
                  limit = task['Concurrency_Limit']
                  stations = []
@@ -367,7 +364,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                  if not found_slot: continue 
                       
             else:
-                # Online Booking - Candidate Selection
+                # 線上邏輯 (Online)
                 t_req = task['Target_Line']
                 c_lines = []
                 
@@ -376,14 +373,11 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     if 0 <= t_idx < total_lines: c_lines = [t_idx]
                 else:
                     c_lines = [x for x in range(total_lines)]
-                    # N-DE Rule
                     if str(base_model).startswith("N-DE") and total_lines >= 4: c_lines = [3]
-                    # N-3610 Rule
                     elif str(base_model).startswith("N-3610"):
                          if total_lines >= 3: c_lines = [2]
                          else: c_lines = []
 
-                # Protect Line 6
                 if not str(base_model).startswith("N-3610") and 2 in c_lines:
                     c_lines.remove(2)
                 
@@ -391,31 +385,25 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
 
                 for l_idx in c_lines:
                     s_time = 0
-                    # Normal setup calculation
                     if line_last_model[l_idx] is not None and line_last_model[l_idx] != base_model:
                         s_time = changeover_mins
                     
                     l_free = line_free_time[l_idx]
                     real_start = max(l_free, min_start_time)
                     
-                    # 邏輯核心：比的是「完工時間」
-                    # 如果能提早完工，就算要換線也值得
-                    # If we switch line: real_start + setup + duration
-                    # If we wait: real_start (which might be late) + 0 + duration
-                    
-                    completion_time = real_start + s_time + prod_duration
-                    
-                    # Score is essentially the completion time
-                    score = completion_time
-                    
-                    # Tie-Breaker: Prefer same line if completion times are very close
-                    # If setups are 0, subtract a tiny bonus to prefer this line
-                    if s_time == 0:
-                        score -= 10 # Bonus for grouping preference if time is comparable
-                    
-                    # Rush Order Logic: Absolute Priority on Earliest FINISH
+                    # 邏輯核心 v6.4
                     if is_rush:
-                        score = completion_time # No grouping bias, just speed
+                        # ★ 急單：絕對優先，只看完工時間，無視任何分組偏好
+                        score = real_start + s_time
+                    else:
+                        # ★ 一般單：有條件分組 (Smart Grouping)
+                        # 如果是同型號 (s_time == 0)，給予一個 "Group Bonus" (減分)
+                        # 這代表：我們願意為了同型號，多等待 60 分鐘。
+                        # 如果等待時間超過 60 分鐘，Bonus 就無法抵消延遲，系統就會選擇換線。
+                        
+                        time_cost = real_start + s_time
+                        group_bonus = -60 if s_time == 0 else 0
+                        score = time_cost + group_bonus
                     
                     if score < possible_start:
                         possible_start = score
@@ -427,9 +415,8 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                 if best_task_candidate is None or possible_start < best_task_candidate[1]:
                       best_task_candidate = (i, possible_start, task)
                 
-                # Dynamic Break: If we found a slot that starts almost immediately without setup
-                # We take it.
-                if possible_start <= min_start_time + prod_duration + 10 and setup_cost == 0:
+                # 如果找到一個完美空檔，直接執行 (加速運算)
+                if possible_start <= min_start_time + 10 and setup_cost == 0:
                     break
         
         # --- End of Scanning ---
@@ -446,7 +433,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             order_id = str(task['Order_ID'])
             base_model = task['Base_Model']
 
-            # Re-calc min_start_time
             if is_offline:
                 start_limit = parse_time_to_mins(offline_settings["start"])
                 if order_id in order_target_line_map:
@@ -466,7 +452,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             best_choice = None
             
             if is_offline:
-                # (Offline logic remains same)
                 off_cat = task['Process_Category']
                 limit = task['Concurrency_Limit']
                 candidate_stations = []
