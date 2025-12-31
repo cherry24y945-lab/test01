@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數
 # ==========================================
-SYSTEM_VERSION = "v6.7 (Final: Product Continuity & Designated Line Fix)"
+SYSTEM_VERSION = "v6.9 (Logic: Rush First -> Continuity < 15mins -> Fill Gap)"
 
 # 線外製程分類與資源限制
 OFFLINE_CONFIG = {
@@ -39,6 +39,7 @@ def create_line_mask(start_str, end_str, days=14):
     mask = np.zeros(total_minutes, dtype=bool)
     start_min = parse_time_to_mins(start_str)
     end_min = parse_time_to_mins(end_str)
+    # 固定休息時間
     breaks = [(600, 605), (720, 780), (900, 905), (1020, 1050)]
     
     for day in range(days):
@@ -231,7 +232,7 @@ def load_and_clean_data(uploaded_file):
         return None, str(e)
 
 # ==========================================
-# 3. 排程運算區 (Two-Phase: Rush First -> Normal with Strict Continuity)
+# 3. 排程運算區 (Two-Phase: Rush -> Strict 15min Continuity)
 # ==========================================
 def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_settings, offline_settings):
     MAX_MINUTES = 14 * 24 * 60 
@@ -277,17 +278,17 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
     rush_orders_global = df[df['Is_Rush']]['Order_ID'].unique()
     df['Order_Is_Rush'] = df['Order_ID'].isin(rush_orders_global)
     
-    # Phase 1: 急單
+    # Phase 1: 急單 (優先)
     df_rush = df[df['Order_Is_Rush']].sort_values(
         by=['Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
         ascending=[True, True, True, True]
     )
     
-    # Phase 2: 一般單 (Sort by Line_Col to ensure designated lines are handled, then by Model)
-    # Adding 'Target_Line' to sort key to group designated tasks together
+    # Phase 2: 一般單 (Target Line First -> Base_Model -> Seq)
+    df['Has_Target_Line'] = df['Target_Line'] > 0
     df_normal = df[~df['Order_Is_Rush']].sort_values(
-        by=['Target_Line', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
-        ascending=[False, True, True, True, True]
+        by=['Has_Target_Line', 'Target_Line', 'Base_Model', 'Order_ID', 'Sequence', 'Priority'], 
+        ascending=[False, True, True, True, True, True]
     )
     
     tasks_rush = df_rush.to_dict('records')
@@ -372,7 +373,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     t_req = task['Target_Line']
                     c_lines = []
                     
-                    # 優先檢查指定線
                     if t_req > 0: 
                         t_idx = t_req - 4
                         if 0 <= t_idx < total_lines: c_lines = [t_idx]
@@ -390,7 +390,6 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
 
                     for l_idx in c_lines:
                         s_time = 0
-                        # 檢查換線
                         if line_last_model[l_idx] is not None and line_last_model[l_idx] != base_model:
                             s_time = changeover_mins
                         
@@ -398,33 +397,41 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                         real_start = max(l_free, min_start_time)
                         
                         # ----------------------------------------------------
-                        # ★ 核心邏輯 v6.7 ★
+                        # ★ 核心邏輯 v6.9: Rush vs 15-min Continuity Rule ★
                         # ----------------------------------------------------
                         if is_rush_phase:
-                            # 【Phase 1: 急單】 無視一切，只求最快完工
+                            # 【Phase 1: 急單】只求最快開始
                             score = real_start + s_time + prod_duration
                             reason = "Rush_Phase"
                         else:
                             # 【Phase 2: 一般單】
-                            # 1. 指定線權重：如果這張單有指定線 (t_req > 0)，且當前檢查的線就是指定線
-                            #    給予超級加分，強制它排進這條線 (除非這條線已經滿到明年)
-                            designated_bonus = -99999 if (t_req > 0 and (t_req-4) == l_idx) else 0
-                            
-                            # 2. 同型號銜接 (Product Continuity)：
-                            #    如果這條線最後一個產品跟現在一樣 (s_time == 0)，給予高加分 (-180分)
-                            #    這代表我們願意為了接續生產，多等待 3 小時。
-                            #    這能解決 "明明有線剛做完同產品，卻跑去別條空線" 的問題。
-                            continuity_bonus = -180 if s_time == 0 else 0
-                            
-                            # 3. 避免空轉 (Idle Avoidance)：
-                            #    如果真的要等太久 (超過 continuity_bonus 的容忍)，才會去別條線。
-                            
-                            completion_time = real_start + s_time + prod_duration
-                            score = completion_time + designated_bonus + continuity_bonus
-                            
-                            if t_req > 0: reason = "Designated"
-                            elif s_time == 0: reason = "Continuity"
-                            else: reason = "Idle_Avoid"
+                            # 1. 指定線 (Hard Lock):
+                            if t_req > 0 and (t_req-4) != l_idx:
+                                score = 9999999
+                                reason = "Wrong_Line"
+                            else:
+                                completion_time = real_start + s_time + prod_duration
+                                
+                                # 2. 同產品接續 (Continuity Check)
+                                if s_time == 0:
+                                    # 計算等待時間
+                                    wait_time = real_start - l_free
+                                    if wait_time <= 15:
+                                        # (2.1) 等待 <= 15分鐘 -> 強制鎖定接續!
+                                        # 給予超級加分，確保不會被其他產品插隊
+                                        continuity_bonus = -999999 
+                                        reason = "Continuity<15m"
+                                    else:
+                                        # (2.2) 等待 > 15分鐘 -> 放棄優先權
+                                        # 視為一般填補，允許其他產品(如果更快)插隊
+                                        continuity_bonus = 0
+                                        reason = "Wait>15m_FillGap"
+                                else:
+                                    # 不同產品 (換線)
+                                    continuity_bonus = 0
+                                    reason = "Diff_Model"
+                                
+                                score = completion_time + continuity_bonus
                         
                         if score < possible_start:
                             possible_start = score
@@ -437,7 +444,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                     if best_task_candidate is None or possible_start < best_task_candidate[1]:
                           best_task_candidate = (i, possible_start, task, decision_reason)
                     
-                    # 完美匹配 (無換線且馬上開始)，直接中斷掃描
+                    # 完美匹配 (無換線且馬上開始)，直接中斷掃描加速
                     if possible_start <= min_start_time + 10 and setup_cost == 0:
                         break
             
