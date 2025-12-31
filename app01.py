@@ -338,7 +338,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
             setup_cost = 0
             
             if is_offline:
-                 # 線外邏輯 (維持不變)
+                 # 線外試算
                  off_cat = task['Process_Category']
                  limit = task['Concurrency_Limit']
                  stations = []
@@ -364,7 +364,7 @@ def run_scheduler(df, total_manpower, total_lines, changeover_mins, line_setting
                  if not found_slot: continue 
                       
             else:
-                # 線上邏輯 (Online)
+                # Online Booking
                 t_req = task['Target_Line']
                 c_lines = []
                 
