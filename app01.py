@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. 全域配置與輔助函數
 # ==========================================
-SYSTEM_VERSION = "v6.9 (Logic: Rush First -> Continuity < 15mins -> Fill Gap)"
+SYSTEM_VERSION = "v6.9.1 (Logic: Rush First -> Continuity < 15mins -> Fill Gap)"
 
 # 線外製程分類與資源限制
 OFFLINE_CONFIG = {
