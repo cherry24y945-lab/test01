@@ -1,5 +1,3 @@
+streamlit==1.31.0
+pandas==2.1.4
 numpy==1.26.2
-streamlit==1.32.0
-pandas==2.2.0
-# 如果有用到 Excel 讀取才加這行，沒用到就刪掉
-openpyxl==3.1.2
